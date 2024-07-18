@@ -799,7 +799,7 @@ class LLMEngine:
 
         # Free the finished sequence groups.
         for scheduler in self.scheduler:
-            scheduler.free_finished_seq_groups()
+            scheduler.swap_finished_seq_groups()
 
         # Create the outputs.
         request_outputs: List[Union[RequestOutput,

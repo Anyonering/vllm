@@ -310,6 +310,11 @@ class Scheduler:
         # Sequence groups in the SWAPPED state.
         # Contain decode requests that are swapped out.
         self.swapped: Deque[SequenceGroup] = deque()
+        # Sequence groups in the HUNG state.
+        # Contain decode requests that are swapped out after finished.
+        self.hung: Deque[SequenceGroup] = deque()
+        # a list of sequence waiting to be freed
+        self.wait_for_free : List[Sequence] = list()
         # Sequence groups finished requests ids since last step iteration.
         # It lets the model know that any state associated with these requests
         # can and must be released after the current step.
@@ -1046,7 +1051,14 @@ class Scheduler:
         for scheduled_seq_group in scheduler_outputs.scheduled_seq_groups:
             self.block_manager.mark_blocks_as_computed(
                 scheduled_seq_group.seq_group)
-
+        if(len(self.hung) > 0):
+            while(len(self.hung) > 0):
+                seq_group = self.hung.popleft()
+                if(self.block_manager.can_swap_out(seq_group)):
+                    mapping = self.block_manager.swap_out_finished(seq_group)
+                    scheduler_outputs.blocks_to_swap_out.extend(mapping)
+                else:
+                    print("Running out of cpu blocks for hanging requests!")
         return seq_group_metadata_list, scheduler_outputs
 
     def fork_seq(self, parent_seq: Sequence, child_seq: Sequence) -> None:
@@ -1054,7 +1066,8 @@ class Scheduler:
 
     def free_seq(self, seq: Sequence) -> None:
         """Free a sequence from a block table."""
-        self.block_manager.free(seq)
+        # self.block_manager.free(seq)
+        self.wait_for_free.append(seq)
 
     def free_finished_seq_groups(self) -> None:
         for queue in [self.running, self.swapped, self.waiting]:
@@ -1064,6 +1077,28 @@ class Scheduler:
             ]
         self.running = deque(seq_group for seq_group in self.running
                              if not seq_group.is_finished())
+        
+    def swap_finished_seq_groups(self) -> None:
+        for queue in [self.running, self.swapped, self.waiting]:
+            self._finished_requests_ids += [
+                seq_group.request_id for seq_group in queue
+                if seq_group.is_finished()
+            ]
+        self.hung.extend(seq_group for queue in [self.running, self.swapped, self.waiting] for seq_group in queue
+                             if seq_group.is_finished())
+        self.running = deque(seq_group for seq_group in self.running
+                             if not seq_group.is_finished())
+        temp_finished_seq_id = [seq_id for seq_group in self.hung for seq_id in seq_group.seqs_dict.keys() ]
+        # for seq_group in self.hung:
+        #     for seq_id in seq_group.seqs_dict.keys():
+        #         temp_finished_seq_id.append(seq_id) 
+        
+        self.wait_for_free = [seq for seq in self.wait_for_free if seq.seq_id not in temp_finished_seq_id] 
+        for seq in self.wait_for_free:
+            self.block_manager.free(seq)
+            
+        self.wait_for_free = []
+        
 
     def _allocate_and_set_running(self, seq_group: SequenceGroup) -> None:
         self.block_manager.allocate(seq_group)

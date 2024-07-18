@@ -593,6 +593,29 @@ class BlockSpaceManagerV1(BlockSpaceManager):
 
         return [(cpu_block.block_number, gpu_block.block_number)
                 for cpu_block, gpu_block in mapping.items()]
+        
+    def swap_out_finished(self, seq_group: SequenceGroup) -> List[Tuple[int, int]]:
+        request_id = seq_group.request_id
+
+        # GPU block -> CPU block.
+        # dict is efficient in lookup `if gpu_block in mapping`
+        mapping: Dict[PhysicalTokenBlock, PhysicalTokenBlock] = {}
+        for seq in seq_group.get_seqs():
+            self.block_tables[seq.seq_id] = \
+                self._swap_block_table(self.block_tables[seq.seq_id],
+                                       self.gpu_allocator,
+                                       self.cpu_allocator,
+                                       mapping)
+
+        if seq_group.is_encoder_decoder():
+            self.cross_block_tables[request_id] = \
+                self._swap_block_table(self.cross_block_tables[request_id],
+                                       self.gpu_allocator,
+                                       self.cpu_allocator,
+                                       mapping)
+
+        return [(cpu_block.block_number, gpu_block.block_number)
+                for cpu_block, gpu_block in mapping.items()]
 
     def _free_block_table(self, block_table: BlockTable) -> None:
         # when using a sliding window, each seq will only use up

@@ -284,6 +284,7 @@ class Worker(LocalOrDistributedWorkerBase):
                 worker_input.blocks_to_swap_in)
         if (worker_input.blocks_to_swap_out is not None
                 and worker_input.blocks_to_swap_out.numel() > 0):
+            print(worker_input.blocks_to_swap_out)
             self.cache_engine[virtual_engine].swap_out(
                 worker_input.blocks_to_swap_out)
         if (worker_input.blocks_to_copy is not None
