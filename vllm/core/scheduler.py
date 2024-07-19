@@ -312,7 +312,7 @@ class Scheduler:
         self.swapped: Deque[SequenceGroup] = deque()
         # Sequence groups in the HUNG state.
         # Contain decode requests that are swapped out after finished.
-        self.hung: Deque[SequenceGroup] = deque()
+        self.hung: List[SequenceGroup] = list()
         # a list of sequence waiting to be freed
         self.wait_for_free : List[Sequence] = list()
         # Sequence groups finished requests ids since last step iteration.
@@ -1052,8 +1052,15 @@ class Scheduler:
             self.block_manager.mark_blocks_as_computed(
                 scheduled_seq_group.seq_group)
         if(len(self.hung) > 0):
+            # print("scheduler_outputs:\n scheduled_seq_groups: ",scheduler_outputs.scheduled_seq_groups)
+            # print("num_prefill_groups: ",scheduler_outputs.num_prefill_groups)
+            # print("num_batched_tokens: ",scheduler_outputs.num_batched_tokens)
+            # print("ignored_seq_groups: ", scheduler_outputs.ignored_seq_groups)
+            # print("num_lookahead_slots: ",scheduler_outputs.num_lookahead_slots)
+            # print("running_queue_size: ", scheduler_outputs.running_queue_size)
+            # print("preempted: ",scheduler_outputs.preempted)
             while(len(self.hung) > 0):
-                seq_group = self.hung.popleft()
+                seq_group = self.hung.pop()
                 if(self.block_manager.can_swap_out(seq_group)):
                     mapping = self.block_manager.swap_out_finished(seq_group)
                     scheduler_outputs.blocks_to_swap_out.extend(mapping)
