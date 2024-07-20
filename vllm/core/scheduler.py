@@ -311,10 +311,19 @@ class Scheduler:
         # Contain decode requests that are swapped out.
         self.swapped: Deque[SequenceGroup] = deque()
         # Sequence groups in the HUNG state.
-        # Contain decode requests that are swapped out after finished.
+        # Contain decode requests that are temporarily holding after finished.
         self.hung: List[SequenceGroup] = list()
+        # Contain requests that are swapped out after finished.
+        self.finished_swapped: List[SequenceGroup] = list()
         # a list of sequence waiting to be freed
         self.wait_for_free : List[Sequence] = list()
+        # This contains the requests_id for the group waiting to be 
+        # reloaded from the host memory to the device.
+        # Temporarily configured by the user 
+        # by changing llm.llm_engine.scheduler[0].refill_requests
+        self.refill_requests: Deque[str] = deque()
+        # Contain requests that have already been reloaded back to device after finished.
+        self.refilled: List[SequenceGroup] = list()
         # Sequence groups finished requests ids since last step iteration.
         # It lets the model know that any state associated with these requests
         # can and must be released after the current step.
@@ -1064,8 +1073,29 @@ class Scheduler:
                 if(self.block_manager.can_swap_out(seq_group)):
                     mapping = self.block_manager.swap_out_finished(seq_group)
                     scheduler_outputs.blocks_to_swap_out.extend(mapping)
+                    self.finished_swapped.append(seq_group)
                 else:
                     print("Running out of cpu blocks for hanging requests!")
+        if(len(self.finished_swapped)> 0 and len(self.refill_requests)> 0):
+            while(len(self.refill_requests)> 0):
+                temp_req_id = self.refill_requests.popleft()
+                temp_seq_group = None
+                find_one = False
+                for seq_group in self.finished_swapped: 
+                    if(seq_group.request_id == temp_req_id):
+                        find_one = True
+                        temp_seq_group = seq_group
+                        break
+                if(find_one and (temp_seq_group is not None)):
+                    if(self.block_manager.can_swap_in(temp_seq_group)):
+                        mapping = self.block_manager.swap_in_refill(seq_group)
+                        scheduler_outputs.blocks_to_swap_in.extend(mapping)
+                        self.refilled.append(seq_group)
+                    else:
+                        print("Running out of gpu blocks for refill requests!")
+                else:
+                    print("Invalid request id!")
+            
         return seq_group_metadata_list, scheduler_outputs
 
     def fork_seq(self, parent_seq: Sequence, child_seq: Sequence) -> None:

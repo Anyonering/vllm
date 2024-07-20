@@ -566,6 +566,30 @@ class BlockSpaceManagerV1(BlockSpaceManager):
 
         return [(cpu_block.block_number, gpu_block.block_number)
                 for cpu_block, gpu_block in mapping.items()]
+        
+    def swap_in_refill(self, seq_group: SequenceGroup) -> List[Tuple[int, int]]:
+
+        request_id = seq_group.request_id
+
+        # CPU block -> GPU block.
+        # dict is efficient in lookup `if cpu_block in mapping`
+        mapping: Dict[PhysicalTokenBlock, PhysicalTokenBlock] = {}
+        for seq in seq_group.get_seqs():
+            self.block_tables[seq.seq_id] = \
+                self._swap_block_table(self.block_tables[seq.seq_id],
+                                       self.cpu_allocator,
+                                       self.gpu_allocator,
+                                       mapping)
+
+        if seq_group.is_encoder_decoder():
+            self.cross_block_tables[request_id] = \
+                self._swap_block_table(self.cross_block_tables[request_id],
+                                       self.cpu_allocator,
+                                       self.gpu_allocator,
+                                       mapping)
+
+        return [(cpu_block.block_number, gpu_block.block_number)
+                for cpu_block, gpu_block in mapping.items()]
 
     def can_swap_out(self, seq_group: SequenceGroup) -> bool:
         blocks = self._get_physical_blocks(seq_group)
