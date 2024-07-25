@@ -259,6 +259,12 @@ class Worker(LocalOrDistributedWorkerBase):
         blocks_to_swap_out = torch.tensor(execute_model_req.blocks_to_swap_out,
                                           device="cpu",
                                           dtype=torch.int64).view(-1, 2)
+        blocks_to_refill = torch.tensor(execute_model_req.blocks_to_refill,
+                                         device="cpu",
+                                         dtype=torch.int64).view(-1, 2)
+        blocks_to_kick_out = torch.tensor(execute_model_req.blocks_to_kick_out,
+                                          device="cpu",
+                                          dtype=torch.int64).view(-1, 2)
         # `blocks_to_copy` is a gpu tensor. The src and tgt of
         # blocks to copy are in the same device, and `blocks_to_copy`
         # can be used directly within cuda kernels.
@@ -269,7 +275,9 @@ class Worker(LocalOrDistributedWorkerBase):
         return WorkerInput(
             num_seq_groups=num_seq_groups,
             blocks_to_swap_in=blocks_to_swap_in,
+            blocks_to_refill=blocks_to_refill,
             blocks_to_swap_out=blocks_to_swap_out,
+            blocks_to_kick_out=blocks_to_kick_out,
             blocks_to_copy=blocks_to_copy,
             virtual_engine=virtual_engine,
         )
@@ -290,7 +298,22 @@ class Worker(LocalOrDistributedWorkerBase):
         if (worker_input.blocks_to_copy is not None
                 and worker_input.blocks_to_copy.numel() > 0):
             self.cache_engine[virtual_engine].copy(worker_input.blocks_to_copy)
-
+            
+    @torch.inference_mode()
+    def execute_worker_cache(self, worker_input: WorkerInput) -> None:
+        virtual_engine = worker_input.virtual_engine
+        # Issue cache operations.
+        if (worker_input.blocks_to_refill is not None
+                and worker_input.blocks_to_refill.numel() > 0):
+            print("blocks_to_refill",worker_input.blocks_to_refill)
+            self.cache_engine[virtual_engine].swap_in(
+                worker_input.blocks_to_refill)
+        if (worker_input.blocks_to_kick_out is not None
+                and worker_input.blocks_to_kick_out.numel() > 0):
+            print("blocks_to_kick_out",worker_input.blocks_to_kick_out)
+            self.cache_engine[virtual_engine].swap_out(
+                worker_input.blocks_to_kick_out)
+        
     def add_lora(self, lora_request: LoRARequest) -> bool:
         return self.model_runner.add_lora(lora_request)
 

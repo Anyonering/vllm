@@ -122,6 +122,10 @@ class SchedulerOutputs:
     blocks_to_swap_in: List[Tuple[int, int]]
     # Blocks to swap out. List of GPU -> CPU block number.
     blocks_to_swap_out: List[Tuple[int, int]]
+    # Blocks to refill when new user prompt may come. List of CPU -> GPU block number.
+    blocks_to_refill: List[Tuple[int, int]] 
+    # Blocks to swap out after a request finished. List of GPU -> CPU block number.
+    blocks_to_kick_out: List[Tuple[int, int]]
     # Blocks to copy. Source to dest block.
     blocks_to_copy: List[Tuple[int, int]]
     # Sequence groups that are going to be ignored.
@@ -859,6 +863,8 @@ class Scheduler:
             num_batched_tokens=budget.num_batched_tokens,
             blocks_to_swap_in=swapped_in.blocks_to_swap_in,
             blocks_to_swap_out=running_scheduled.blocks_to_swap_out,
+            blocks_to_kick_out=[],
+            blocks_to_refill=[],
             blocks_to_copy=running_scheduled.blocks_to_copy +
             swapped_in.blocks_to_copy,
             ignored_seq_groups=prefills.ignored_seq_groups +
@@ -948,6 +954,8 @@ class Scheduler:
             num_batched_tokens=budget.num_batched_tokens,
             blocks_to_swap_in=swapped_in.blocks_to_swap_in,
             blocks_to_swap_out=running_scheduled.blocks_to_swap_out,
+            blocks_to_kick_out=[],
+            blocks_to_refill=[],
             blocks_to_copy=running_scheduled.blocks_to_copy +
             swapped_in.blocks_to_copy,
             ignored_seq_groups=prefills.ignored_seq_groups +
@@ -1072,7 +1080,7 @@ class Scheduler:
                 seq_group = self.hung.pop()
                 if(self.block_manager.can_swap_out(seq_group)):
                     mapping = self.block_manager.swap_out_finished(seq_group)
-                    scheduler_outputs.blocks_to_swap_out.extend(mapping)
+                    scheduler_outputs.blocks_to_kick_out.extend(mapping)
                     self.finished_swapped.append(seq_group)
                 else:
                     print("Running out of cpu blocks for hanging requests!")
@@ -1089,13 +1097,14 @@ class Scheduler:
                 if(find_one and (temp_seq_group is not None)):
                     if(self.block_manager.can_swap_in(temp_seq_group)):
                         mapping = self.block_manager.swap_in_refill(seq_group)
-                        scheduler_outputs.blocks_to_swap_in.extend(mapping)
+                        scheduler_outputs.blocks_to_refill.extend(mapping)
                         self.refilled.append(seq_group)
                     else:
                         print("Running out of gpu blocks for refill requests!")
                 else:
                     print("Invalid request id!")
-            
+        # if(len(scheduler_outputs.blocks_to_refill)>0):
+        #     print("blocks to refill: ",scheduler_outputs.blocks_to_refill)
         return seq_group_metadata_list, scheduler_outputs
 
     def fork_seq(self, parent_seq: Sequence, child_seq: Sequence) -> None:

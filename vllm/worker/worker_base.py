@@ -124,6 +124,8 @@ class WorkerInput:
     num_seq_groups: Optional[int] = None
     blocks_to_swap_in: Optional[torch.Tensor] = None
     blocks_to_swap_out: Optional[torch.Tensor] = None
+    blocks_to_kick_out: Optional[torch.Tensor] = None
+    blocks_to_refill: Optional[torch.Tensor] = None
     blocks_to_copy: Optional[torch.Tensor] = None
     virtual_engine: int = 0
 
@@ -140,6 +142,8 @@ class WorkerInput:
             num_seq_groups=tensor_dict.pop("num_seq_groups"),
             blocks_to_swap_in=tensor_dict.pop("blocks_to_swap_in"),
             blocks_to_swap_out=tensor_dict.pop("blocks_to_swap_out"),
+            blocks_to_kick_out=tensor_dict.pop("blocks_to_kick_out"),
+            blocks_to_refill=tensor_dict.pop("blocks_to_refill"),
             blocks_to_copy=tensor_dict.pop("blocks_to_copy"),
             virtual_engine=tensor_dict["virtual_engine"],
         )
@@ -153,6 +157,8 @@ class WorkerInput:
             "num_seq_groups": self.num_seq_groups,
             "blocks_to_swap_in": self.blocks_to_swap_in,
             "blocks_to_swap_out": self.blocks_to_swap_out,
+            "blocks_to_kick_out": self.blocks_to_kick_out,
+            "blocks_to_refill": self.blocks_to_refill,
             "blocks_to_copy": self.blocks_to_copy,
             "virtual_engine": self.virtual_engine,
         }
@@ -171,6 +177,7 @@ class LocalOrDistributedWorkerBase(WorkerBase):
     """
     is_driver_worker: bool
     model_runner: ModelRunnerBase
+    cache_stream = torch.cuda.Stream()
 
     @property
     @abstractmethod
@@ -207,6 +214,13 @@ class LocalOrDistributedWorkerBase(WorkerBase):
 
     @abstractmethod
     def execute_worker(self, worker_input: WorkerInput) -> None:
+        """
+        Process an execution request.
+        """
+        raise NotImplementedError
+    
+    @abstractmethod
+    def execute_worker_cache(self, worker_input: WorkerInput) -> None:
         """
         Process an execution request.
         """
@@ -257,6 +271,15 @@ class LocalOrDistributedWorkerBase(WorkerBase):
                 self.model_runner.
                 make_model_input_from_broadcasted_tensor_dict(broadcast_data))
 
+        # if(worker_input.blocks_to_refill is not None):
+        #     print("worker_input.blocks_to_refill: ", worker_input.blocks_to_refill)
+        with torch.cuda.stream(self.cache_stream):
+            self.execute_worker_cache(worker_input)
+        if (worker_input.blocks_to_refill is not None
+                and worker_input.blocks_to_refill.numel() > 0):
+            # print("Geetting this line!!\nGeetting this line!!\n")
+            torch.cuda.current_stream().wait_stream(self.cache_stream)
+        # print("worker_input.blocks_to_refill: ",worker_input.blocks_to_refill)
         self.execute_worker(worker_input)
 
         # If there is no input, we don't need to execute the model.

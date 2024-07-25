@@ -974,6 +974,10 @@ class ExecuteModelRequest:
     blocks_to_swap_in: List[Tuple[int, int]] = field(default_factory=list)
     # Blocks to swap out. List of GPU -> CPU block number.
     blocks_to_swap_out: List[Tuple[int, int]] = field(default_factory=list)
+    # Blocks to refill when new user prompt may come. List of CPU -> GPU block number.
+    blocks_to_refill: List[Tuple[int, int]] = field(default_factory=list)
+    # Blocks to swap out after a request finished. List of GPU -> CPU block number.
+    blocks_to_kick_out: List[Tuple[int, int]] = field(default_factory=list)
     # Blocks to copy. Source to dest block.
     blocks_to_copy: List[Tuple[int, int]] = field(default_factory=list)
     # Virtual engine ID for pipeline parallel.
@@ -996,6 +1000,8 @@ class ExecuteModelRequest:
         return ExecuteModelRequest(
             seq_group_metadata_list=seq_group_metadata_list,
             blocks_to_swap_in=self.blocks_to_swap_in.copy(),
+            blocks_to_refill=self.blocks_to_refill.copy(),
+            blocks_to_kick_out=self.blocks_to_kick_out.copy(),
             blocks_to_swap_out=self.blocks_to_swap_out.copy(),
             blocks_to_copy=self.blocks_to_copy.copy(),
             virtual_engine=self.virtual_engine,
