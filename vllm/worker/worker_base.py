@@ -126,6 +126,10 @@ class WorkerInput:
     blocks_to_swap_out: Optional[torch.Tensor] = None
     blocks_to_kick_out: Optional[torch.Tensor] = None
     blocks_to_refill: Optional[torch.Tensor] = None
+    kick_out_index: Optional[torch.Tensor] = None
+    refill_index: Optional[torch.Tensor] = None
+    kick_out_stream: Optional[torch.Tensor] = None
+    refill_stream: Optional[torch.Tensor] = None
     blocks_to_copy: Optional[torch.Tensor] = None
     virtual_engine: int = 0
 
@@ -144,6 +148,10 @@ class WorkerInput:
             blocks_to_swap_out=tensor_dict.pop("blocks_to_swap_out"),
             blocks_to_kick_out=tensor_dict.pop("blocks_to_kick_out"),
             blocks_to_refill=tensor_dict.pop("blocks_to_refill"),
+            kick_out_index=tensor_dict.pop("kick_out_index"),
+            refill_index=tensor_dict.pop("refill_index"),
+            kick_out_stream=tensor_dict.pop("kick_out_stream"),
+            refill_stream=tensor_dict.pop("refill_stream"),
             blocks_to_copy=tensor_dict.pop("blocks_to_copy"),
             virtual_engine=tensor_dict["virtual_engine"],
         )
@@ -159,6 +167,10 @@ class WorkerInput:
             "blocks_to_swap_out": self.blocks_to_swap_out,
             "blocks_to_kick_out": self.blocks_to_kick_out,
             "blocks_to_refill": self.blocks_to_refill,
+            "kick_out_index": self.kick_out_index,
+            "refill_index": self.refill_index,
+            "refill_stream":self.refill_stream,
+            "kick_out_stream":self.kick_out_stream,
             "blocks_to_copy": self.blocks_to_copy,
             "virtual_engine": self.virtual_engine,
         }
@@ -273,12 +285,12 @@ class LocalOrDistributedWorkerBase(WorkerBase):
 
         # if(worker_input.blocks_to_refill is not None):
         #     print("worker_input.blocks_to_refill: ", worker_input.blocks_to_refill)
-        with torch.cuda.stream(self.cache_stream):
-            self.execute_worker_cache(worker_input)
-        if (worker_input.blocks_to_refill is not None
-                and worker_input.blocks_to_refill.numel() > 0):
-            # print("Geetting this line!!\nGeetting this line!!\n")
-            torch.cuda.current_stream().wait_stream(self.cache_stream)
+        # with torch.cuda.stream(self.cache_stream):
+        self.execute_worker_cache(worker_input)
+        # if (worker_input.blocks_to_refill is not None
+        #         and worker_input.blocks_to_refill.numel() > 0):
+        #     # print("Geetting this line!!\nGeetting this line!!\n")
+        #     torch.cuda.current_stream().wait_stream(self.cache_stream)
         # print("worker_input.blocks_to_refill: ",worker_input.blocks_to_refill)
         self.execute_worker(worker_input)
 

@@ -882,6 +882,10 @@ class LLMEngine:
                 blocks_to_copy=scheduler_outputs.blocks_to_copy,
                 blocks_to_kick_out=scheduler_outputs.blocks_to_kick_out,
                 blocks_to_refill=scheduler_outputs.blocks_to_refill,
+                kick_out_index=scheduler_outputs.kick_out_index,
+                refill_index=scheduler_outputs.refill_index,
+                kick_out_stream=scheduler_outputs.kick_out_stream,
+                refill_stream=scheduler_outputs.refill_stream,
                 num_lookahead_slots=scheduler_outputs.num_lookahead_slots,
                 running_queue_size=scheduler_outputs.running_queue_size,
                 finished_requests_ids=finished_requests_ids)

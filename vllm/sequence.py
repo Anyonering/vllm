@@ -978,6 +978,16 @@ class ExecuteModelRequest:
     blocks_to_refill: List[Tuple[int, int]] = field(default_factory=list)
     # Blocks to swap out after a request finished. List of GPU -> CPU block number.
     blocks_to_kick_out: List[Tuple[int, int]] = field(default_factory=list)
+    # the index of blocks to kick out
+    # in the form of [len(block of req_1), len(block of req_2),...]
+    kick_out_index: List[int] = field(default_factory=list)
+    # the index of blocks to refill
+    # follow the same form as kick out index list
+    refill_index: List[int] = field(default_factory=list)
+    # the stream id in range(0,cache_config.num_stream) for each req
+    kick_out_stream: List[int] = field(default_factory=list)
+    # the stream id in range(0,cache_config.num_stream) for each req
+    refill_stream: List[int] = field(default_factory=list)
     # Blocks to copy. Source to dest block.
     blocks_to_copy: List[Tuple[int, int]] = field(default_factory=list)
     # Virtual engine ID for pipeline parallel.
@@ -1004,6 +1014,10 @@ class ExecuteModelRequest:
             blocks_to_kick_out=self.blocks_to_kick_out.copy(),
             blocks_to_swap_out=self.blocks_to_swap_out.copy(),
             blocks_to_copy=self.blocks_to_copy.copy(),
+            kick_out_index=self.kick_out_index.copy(),
+            refill_index=self.refill_index.copy(),
+            kick_out_stream=self.kick_out_stream.copy(),
+            refill_stream=self.refill_stream.copy(),
             virtual_engine=self.virtual_engine,
             num_lookahead_slots=self.num_lookahead_slots,
             running_queue_size=self.running_queue_size,

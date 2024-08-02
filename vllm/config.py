@@ -447,6 +447,9 @@ class CacheConfig:
         # Will be set after profiling.
         self.num_gpu_blocks = None
         self.num_cpu_blocks = None
+        
+        # Stream Pool Size
+        self.num_stream = 50
 
     def metrics_info(self):
         # convert cache_config to dict(key: str, value: str) for prometheus

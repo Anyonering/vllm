@@ -24,6 +24,9 @@ ENABLE_ARTIFICIAL_PREEMPT = bool(
 ARTIFICIAL_PREEMPTION_PROB = 0.5
 ARTIFICIAL_PREEMPTION_MAX_CNT = 500
 
+KICKING = 0
+REFILLING = 1
+
 
 class PreemptionMode(enum.Enum):
     """Preemption modes.
@@ -122,6 +125,16 @@ class SchedulerOutputs:
     blocks_to_swap_in: List[Tuple[int, int]]
     # Blocks to swap out. List of GPU -> CPU block number.
     blocks_to_swap_out: List[Tuple[int, int]]
+    # the index of blocks to kick out
+    # in the form of [len(block of req_1), len(block of req_2),...]
+    kick_out_index: List[int]
+    # the stream id in range(0,cache_config.num_stream) for each req
+    kick_out_stream: List[int]
+    # the index of blocks to refill
+    # follow the same form as kick out index list
+    refill_index: List[int]
+    # the stream id in range(0,cache_config.num_stream) for each req
+    refill_stream: List[int]
     # Blocks to refill when new user prompt may come. List of CPU -> GPU block number.
     blocks_to_refill: List[Tuple[int, int]] 
     # Blocks to swap out after a request finished. List of GPU -> CPU block number.
@@ -332,6 +345,10 @@ class Scheduler:
         # It lets the model know that any state associated with these requests
         # can and must be released after the current step.
         self._finished_requests_ids: List[str] = list()
+        # cuda stream that are free to use
+        self.stream_list = [i for i in range(0,cache_config.num_stream)]
+        # a list of tuple (stream_id, req_id, kicking/refilling)
+        self.stream_in_use: List[Tuple] = list()
         # Time at previous scheduling step
         self.prev_time = 0.0
         # Did we schedule a prompt at previous step?
@@ -865,6 +882,10 @@ class Scheduler:
             blocks_to_swap_out=running_scheduled.blocks_to_swap_out,
             blocks_to_kick_out=[],
             blocks_to_refill=[],
+            kick_out_index=[],
+            refill_index=[],
+            kick_out_stream=[],
+            refill_stream=[],
             blocks_to_copy=running_scheduled.blocks_to_copy +
             swapped_in.blocks_to_copy,
             ignored_seq_groups=prefills.ignored_seq_groups +
@@ -1080,7 +1101,15 @@ class Scheduler:
                 seq_group = self.hung.pop()
                 if(self.block_manager.can_swap_out(seq_group)):
                     mapping = self.block_manager.swap_out_finished(seq_group)
+                    stream_id = None
+                    if(len(self.stream_list)> 0):
+                        stream_id = self.stream_list.pop(0)
+                    else:
+                        stream_id = self.stream_in_use[0][0]
+                    scheduler_outputs.kick_out_index.extend([len(mapping)])
                     scheduler_outputs.blocks_to_kick_out.extend(mapping)
+                    scheduler_outputs.kick_out_stream.extend([stream_id])
+                    self.stream_in_use.append((stream_id,seq_group.request_id,KICKING))
                     self.finished_swapped.append(seq_group)
                 else:
                     print("Running out of cpu blocks for hanging requests!")
@@ -1097,7 +1126,27 @@ class Scheduler:
                 if(find_one and (temp_seq_group is not None)):
                     if(self.block_manager.can_swap_in(temp_seq_group)):
                         mapping = self.block_manager.swap_in_refill(seq_group)
+                        stream_id = None
+                        has_finished_kick = True
+                        index_to_pop = None
+                        for stream_info in self.stream_in_use:
+                            if(stream_info[1]==seq_group.request_id and stream_info[2]==KICKING):
+                                stream_id = stream_info[0]
+                                has_finished_kick = False
+                                index_to_pop = self.stream_in_use.index(stream_info)
+                                break
+                        if(has_finished_kick):
+                            if(len(self.stream_list)> 0):
+                                stream_id = self.stream_list.pop(0)
+                            else:
+                                stream_id = self.stream_in_use[0][0]
+                        else:
+                            self.stream_in_use.pop(index_to_pop)
+                            
+                        self.stream_in_use.append((stream_id,seq_group.request_id,REFILLING))
+                        scheduler_outputs.refill_index.extend([len(mapping)])
                         scheduler_outputs.blocks_to_refill.extend(mapping)
+                        scheduler_outputs.refill_stream.extend([stream_id])
                         self.refilled.append(seq_group)
                     else:
                         print("Running out of gpu blocks for refill requests!")

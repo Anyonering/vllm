@@ -106,6 +106,10 @@ class Worker(LocalOrDistributedWorkerBase):
         self.cache_engine: List[CacheEngine]
         # Initialize gpu_cache as embedding models don't initialize kv_caches
         self.gpu_cache: Optional[List[List[torch.tensor]]] = None
+        # the stream pool that are available for use
+        self.cache_stream_pool = [torch.cuda.Stream() for i in range(cache_config.num_stream)]
+        # the stream pool that are currently in use
+        self.stream_in_use = []
 
     def init_device(self) -> None:
         if self.device_config.device.type == "cuda":
@@ -265,6 +269,10 @@ class Worker(LocalOrDistributedWorkerBase):
         blocks_to_kick_out = torch.tensor(execute_model_req.blocks_to_kick_out,
                                           device="cpu",
                                           dtype=torch.int64).view(-1, 2)
+        refill_index = torch.tensor(execute_model_req.refill_index, device="cpu", dtype=torch.int64)
+        kick_out_index = torch.tensor(execute_model_req.kick_out_index, device="cpu", dtype=torch.int64)
+        refill_stream = torch.tensor(execute_model_req.refill_stream, device="cpu", dtype=torch.int64)
+        kick_out_stream = torch.tensor(execute_model_req.kick_out_stream, device="cpu", dtype=torch.int64)
         # `blocks_to_copy` is a gpu tensor. The src and tgt of
         # blocks to copy are in the same device, and `blocks_to_copy`
         # can be used directly within cuda kernels.
@@ -278,6 +286,10 @@ class Worker(LocalOrDistributedWorkerBase):
             blocks_to_refill=blocks_to_refill,
             blocks_to_swap_out=blocks_to_swap_out,
             blocks_to_kick_out=blocks_to_kick_out,
+            kick_out_index=kick_out_index,
+            refill_index=refill_index,
+            refill_stream=refill_stream,
+            kick_out_stream=kick_out_stream,
             blocks_to_copy=blocks_to_copy,
             virtual_engine=virtual_engine,
         )
@@ -306,13 +318,29 @@ class Worker(LocalOrDistributedWorkerBase):
         if (worker_input.blocks_to_refill is not None
                 and worker_input.blocks_to_refill.numel() > 0):
             print("blocks_to_refill",worker_input.blocks_to_refill)
-            self.cache_engine[virtual_engine].swap_in(
-                worker_input.blocks_to_refill)
+            start_pos = 0
+            for i in range(worker_input.refill_index.size(dim=0)):
+                with torch.cuda.stream(self.cache_stream_pool[worker_input.refill_stream[i]]):
+                    self.cache_engine[virtual_engine].swap_in(
+                        worker_input.blocks_to_refill[start_pos:worker_input.refill_index[i]])
+                start_pos += worker_input.refill_index[i]
+                
         if (worker_input.blocks_to_kick_out is not None
                 and worker_input.blocks_to_kick_out.numel() > 0):
             print("blocks_to_kick_out",worker_input.blocks_to_kick_out)
-            self.cache_engine[virtual_engine].swap_out(
-                worker_input.blocks_to_kick_out)
+            start_pos = 0
+            print(worker_input.kick_out_index.size(dim=0))
+            for i in range(worker_input.kick_out_index.size(dim=0)):
+                with torch.cuda.stream(self.cache_stream_pool[worker_input.kick_out_stream[i]]):
+                    self.cache_engine[virtual_engine].swap_out(
+                        worker_input.blocks_to_kick_out[start_pos:worker_input.kick_out_index[i]])
+                start_pos += worker_input.kick_out_index[i]
+            
+        # if(worker_input.blocks_to_kick_out is not None
+        #         and worker_input.blocks_to_kick_out.numel() > 0 and
+        #         worker_input.blocks_to_refill is not None
+        #         and worker_input.blocks_to_refill.numel() > 0):
+        #     print("Warning: this is dangerous to kick out and refill at the same time!\nWarning: this is dangerous to kick out and refill at the same time!\n")
         
     def add_lora(self, lora_request: LoRARequest) -> bool:
         return self.model_runner.add_lora(lora_request)
