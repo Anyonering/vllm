@@ -417,11 +417,12 @@ class GPUModelRunnerBase(ModelRunnerBase[TModelInputForGPU]):
                                      1) // self.block_size
             block_aligned_sliding_window = \
                 sliding_window_blocks * self.block_size
-
+                
         for seq_group_metadata in seq_group_metadata_list:
             seq_ids = list(seq_group_metadata.seq_data.keys())
             is_prompt = seq_group_metadata.is_prompt
-
+            is_profile_run = _is_block_tables_empty(
+                    seq_group_metadata.block_tables)
             for seq_id in seq_ids:
                 computed_block_nums = seq_group_metadata.computed_block_nums
                 if (self.scheduler_config is not None
@@ -457,7 +458,7 @@ class GPUModelRunnerBase(ModelRunnerBase[TModelInputForGPU]):
                                     and len(computed_block_nums) > 0
                                     and self.sliding_window is None
                                     and is_prompt)
-
+                prefill_with_context = (is_prompt and (seq_len > context_len) and context_len > 0)
                 # These are seq_len/context_len capped to the sliding window.
                 # They are passed to decode kernel.
                 # We still need original seq_len/context_len to compute slot
@@ -489,7 +490,6 @@ class GPUModelRunnerBase(ModelRunnerBase[TModelInputForGPU]):
                     assert computed_block_nums is not None
                     context_len = len(computed_block_nums) * self.block_size
                     tokens = tokens[context_len:]
-
                     # need to think what to set it to when we have both sliding
                     # window and prefix caching...
                     assert self.sliding_window is None, \
@@ -515,6 +515,8 @@ class GPUModelRunnerBase(ModelRunnerBase[TModelInputForGPU]):
                     else:
                         # Only happens when memory profiling runs.
                         block_table = []
+                elif (prefill_with_context and (seq_group_metadata.block_tables is not None)):
+                    block_table = seq_group_metadata.block_tables[seq_id]
                 else:
                     # Prefill without chunked prefill or memory profiling.
                     block_table = []

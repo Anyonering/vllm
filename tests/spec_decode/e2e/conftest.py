@@ -48,7 +48,7 @@ class AsyncLLM:
         tokenizer_revision: Optional[str] = None,
         seed: int = 0,
         gpu_memory_utilization: float = 0.9,
-        swap_space: int = 4,
+        swap_space: int = 8,
         enforce_eager: bool = False,
         max_seq_len_to_capture: int = 8192,
         disable_custom_all_reduce: bool = False,

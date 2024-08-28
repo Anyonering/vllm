@@ -193,6 +193,7 @@ class SequenceData:
         # If all tokens are computed, it means it is in decoding phase.
         if self.get_num_uncomputed_tokens() == 0:
             self._stage = SequenceStage.DECODE
+            # print("current stage: ",self._stage)
 
     def reset_state_for_recompute(self) -> None:
         """Reset the number of computed tokens from this sequence. It is
@@ -440,6 +441,7 @@ class SequenceGroup:
         encoder_seq: Optional[Sequence] = None,
         trace_headers: Optional[Dict[str, str]] = None,
         prompt_adapter_request: Optional[PromptAdapterRequest] = None,
+        session_id: Optional[int] = None,
     ) -> None:
         self.request_id = request_id
         self.seqs_dict = {seq.seq_id: seq for seq in seqs}
@@ -457,6 +459,7 @@ class SequenceGroup:
         self.prompt_adapter_request = prompt_adapter_request
         self.encoder_seq = encoder_seq
         self.trace_headers = trace_headers
+        self.session_id = session_id
 
     @property
     def prompt(self) -> Optional[str]:
@@ -489,7 +492,17 @@ class SequenceGroup:
     def prompt_adapter_num_virtual_tokens(self) -> int:
         return self.prompt_adapter_request.prompt_adapter_num_virtual_tokens\
                          if self.prompt_adapter_request else 0
+                        
+    def get_context_req_id(self) -> str:
+        return self.context_req_id
+    
+    def set_context_req_id(self, context_req_id: str) -> None:
+        self.context_req_id = context_req_id
 
+    def set_seq_group_status(self) -> None:
+        for seq in self.seqs_dict.values():
+            seq.status =  SequenceStatus.WAITING
+            
     def get_last_latency(self, now: float) -> Optional[float]:
         """Sets the last token time for Request level timings."""
         # If still in prefill phase, raise Error.
@@ -988,6 +1001,8 @@ class ExecuteModelRequest:
     kick_out_stream: List[int] = field(default_factory=list)
     # the stream id in range(0,cache_config.num_stream) for each req
     refill_stream: List[int] = field(default_factory=list)
+    # the stream id in range(0,cache_config.num_stream) for workers to synchronize
+    stream_to_sync: List[int] = field(default_factory=list)
     # Blocks to copy. Source to dest block.
     blocks_to_copy: List[Tuple[int, int]] = field(default_factory=list)
     # Virtual engine ID for pipeline parallel.

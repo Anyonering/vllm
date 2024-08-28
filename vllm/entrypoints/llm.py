@@ -113,7 +113,7 @@ class LLM:
         tokenizer_revision: Optional[str] = None,
         seed: int = 0,
         gpu_memory_utilization: float = 0.9,
-        swap_space: int = 4,
+        swap_space: int = 1,
         enforce_eager: bool = False,
         max_context_len_to_capture: Optional[int] = None,
         max_seq_len_to_capture: int = 8192,
@@ -257,6 +257,8 @@ class LLM:
         use_tqdm: bool = True,
         lora_request: Optional[Union[List[LoRARequest], LoRARequest]] = None,
         prompt_adapter_request: Optional[PromptAdapterRequest] = None,
+        refill_requests: Optional[Union[List[int],int]] = None,
+        session_ids: Optional[Union[List[int],int]] = None,
     ) -> List[RequestOutput]:
         """Generates the completions for the input prompts.
 
@@ -303,12 +305,26 @@ class LLM:
         if sampling_params is None:
             # Use default sampling params.
             sampling_params = SamplingParams()
+            
+        if(session_ids is None):
+            if(type(inputs) is list):
+                session_ids = self.llm_engine.scheduler[0].get_new_session_id(request_num=len(inputs))
+            else:
+                session_ids = self.llm_engine.scheduler[0].get_new_session_id()
+                
 
+        if(refill_requests is not None):
+            if(isinstance(refill_requests,list)):
+                self.llm_engine.scheduler[0].refill_requests.extend(refill_requests)
+            else:
+                self.llm_engine.scheduler[0].refill_requests.append(refill_requests)
+                
         self._validate_and_add_requests(
             inputs=inputs,
             params=sampling_params,
             lora_request=lora_request,
-            prompt_adapter_request=prompt_adapter_request)
+            prompt_adapter_request=prompt_adapter_request,
+            session_ids=session_ids)
 
         outputs = self._run_engine(use_tqdm=use_tqdm)
         return LLMEngine.validate_outputs(outputs, RequestOutput)
@@ -513,6 +529,7 @@ class LLM:
                       Sequence[PoolingParams]],
         lora_request: Optional[Union[Sequence[LoRARequest], LoRARequest]],
         prompt_adapter_request: Optional[PromptAdapterRequest],
+        session_ids: Union[int,List[int]]
     ) -> None:
         if isinstance(inputs, (str, dict)):
             # Convert a single prompt to a list.
@@ -527,11 +544,17 @@ class LLM:
                       list) and len(lora_request) != num_requests:
             raise ValueError("The lengths of prompts and lora_request "
                              "must be the same.")
+        if(isinstance(session_ids,list) and len(session_ids) != num_requests):
+            print("session id length: ",len(session_ids))
+            print("num requests: ",num_requests)
+            raise ValueError("The lengths of prompts and session ids "
+                             "must be the same.")
 
         # Add requests to the engine.
         for i, request_inputs in enumerate(inputs):
             self._add_request(
                 request_inputs,
+                session_ids[i] if isinstance(session_ids, list) else session_ids,
                 params[i] if isinstance(params, Sequence) else params,
                 lora_request=lora_request[i] if isinstance(
                     lora_request, Sequence) else lora_request,
@@ -540,14 +563,17 @@ class LLM:
     def _add_request(
             self,
             inputs: PromptInputs,
+            session_id: int,
             params: Union[SamplingParams, PoolingParams],
             lora_request: Optional[Union[List[LoRARequest],
                                          LoRARequest]] = None,
-            prompt_adapter_request: Optional[PromptAdapterRequest] = None
+            prompt_adapter_request: Optional[PromptAdapterRequest] = None,
+            
     ) -> None:
         request_id = str(next(self.request_counter))
         self.llm_engine.add_request(
             request_id,
+            session_id,
             inputs,
             params,
             lora_request=lora_request,

@@ -135,6 +135,8 @@ class SchedulerOutputs:
     refill_index: List[int]
     # the stream id in range(0,cache_config.num_stream) for each req
     refill_stream: List[int]
+    # the stream id in range(0,cache_config.num_stream) for workers to synchronize
+    stream_to_sync: List[int]
     # Blocks to refill when new user prompt may come. List of CPU -> GPU block number.
     blocks_to_refill: List[Tuple[int, int]] 
     # Blocks to swap out after a request finished. List of GPU -> CPU block number.
@@ -334,17 +336,22 @@ class Scheduler:
         self.finished_swapped: List[SequenceGroup] = list()
         # a list of sequence waiting to be freed
         self.wait_for_free : List[Sequence] = list()
-        # This contains the requests_id for the group waiting to be 
+        # This contains the session_id for the group waiting to be 
         # reloaded from the host memory to the device.
         # Temporarily configured by the user 
         # by changing llm.llm_engine.scheduler[0].refill_requests
-        self.refill_requests: Deque[str] = deque()
+        self.refill_requests: Deque[int] = deque()
         # Contain requests that have already been reloaded back to device after finished.
         self.refilled: List[SequenceGroup] = list()
+        # Sequence groups in the WAITING state with context.
+        # Contain new prefill requests with their history.
+        self.refill_wait: Deque[SequenceGroup] = deque()
         # Sequence groups finished requests ids since last step iteration.
         # It lets the model know that any state associated with these requests
         # can and must be released after the current step.
         self._finished_requests_ids: List[str] = list()
+        # the context request id of the refill_wait requests
+        self.context_req_id_ref: List[str] = list()
         # cuda stream that are free to use
         self.stream_list = [i for i in range(0,cache_config.num_stream)]
         # a list of tuple (stream_id, req_id, kicking/refilling)
@@ -353,11 +360,16 @@ class Scheduler:
         self.prev_time = 0.0
         # Did we schedule a prompt at previous step?
         self.prev_prompt = False
-        # Latency of the last prompt step
+        # Latency of the last prompt step 
         self.last_prompt_latency = 0.0
+        # Time at previous scheduling step in refilling
+        self.prev_time_refill = 0.0
+        # Did we schedule a prompt at previous step in refilling?
+        self.prev_prompt_refill = False
+        # Latency of the last prompt step in refill
+        self.last_prompt_latency_refill = 0.0
         # preemption mode, RECOMPUTE or SWAP
         self.user_specified_preemption_mode = scheduler_config.preemption_mode
-
         # The following field is test-only. It is used to inject artificial
         # preemption.
         self.enable_artificial_preemption = ENABLE_ARTIFICIAL_PREEMPT
@@ -365,6 +377,7 @@ class Scheduler:
                                        if self.enable_artificial_preemption
                                        else 0)
         self.num_cumulative_preemption: int = 0
+        self.cumulative_session_id = -1
 
     @property
     def lora_enabled(self) -> bool:
@@ -375,9 +388,35 @@ class Scheduler:
         """The number of new tokens."""
         return 1
 
-    def add_seq_group(self, seq_group: SequenceGroup) -> None:
-        # Add sequence groups to the waiting queue.
-        self.waiting.append(seq_group)
+    def add_seq_group(self, seq_group: SequenceGroup, session_id: int) -> None:
+        is_refill = False
+        context_seq_group = None
+        for refill_seq_group in self.refilled:
+            if (refill_seq_group.session_id == session_id):
+                is_refill = True
+                context_seq_group = refill_seq_group
+        if(is_refill):
+            seq_group.session_id = session_id
+            self.refill_wait.append(seq_group)
+            self.context_req_id_ref.append(context_seq_group.request_id)
+        else:
+            # Add sequence groups to the waiting queue.
+            if(session_id > self.cumulative_session_id):
+                # the given session id is greater than cumulative session id
+                self.cumulative_session_id = session_id
+            seq_group.session_id = session_id
+            self.waiting.append(seq_group)
+            
+    def get_new_session_id(self, request_num: Optional[int] = None):
+        if(request_num is None or request_num == 1):
+            self.cumulative_session_id += 1
+            print("new session id: ",self.cumulative_session_id)
+            return self.cumulative_session_id
+        else:
+            new_session_id_list = list(range(self.cumulative_session_id+1,self.cumulative_session_id+1+request_num))
+            self.cumulative_session_id +=request_num
+            print("new session ids list: ",new_session_id_list)
+            return new_session_id_list
 
     def abort_seq_group(self, request_id: Union[str, Iterable[str]]) -> None:
         """Aborts a sequence group with the given ID.
@@ -417,7 +456,7 @@ class Scheduler:
 
     def has_unfinished_seqs(self) -> bool:
         return len(self.waiting) != 0 or len(self.running) != 0 or len(
-            self.swapped) != 0
+            self.swapped) != 0 or len(self.refill_wait) !=0
 
     def get_num_unfinished_seq_groups(self) -> int:
         return len(self.waiting) + len(self.running) + len(self.swapped)
@@ -886,6 +925,7 @@ class Scheduler:
             refill_index=[],
             kick_out_stream=[],
             refill_stream=[],
+            stream_to_sync=[],
             blocks_to_copy=running_scheduled.blocks_to_copy +
             swapped_in.blocks_to_copy,
             ignored_seq_groups=prefills.ignored_seq_groups +
@@ -1012,14 +1052,136 @@ class Scheduler:
             seq_group=seq_group,
             num_lookahead_slots=self._get_num_lookahead_slots(is_prefill),
         )
+    def refill_schedule(self)-> SchedulerOutputs:
+        ignored_seq_groups: List[SequenceGroup] = []
+        refill_seq_groups: List[SequenceGroup] = []
+        budget = SchedulingBudget(
+            token_budget=self.scheduler_config.max_num_batched_tokens,
+            max_num_seqs=self.scheduler_config.max_num_seqs,
+        )
+        for seq_group in self.running:
+            budget.add_num_seqs(seq_group.request_id,
+                                seq_group.get_max_num_running_seqs())
+        while len(self.refill_wait) > 0 and len(self.context_req_id_ref) > 0:
+            context_req_id = self.context_req_id_ref.pop(0)
+            context_group = None
+            
+            seq_group = self.refill_wait.popleft()
+            seq_group.set_seq_group_status()
+            # num_new_tokens = self._get_num_new_tokens(seq_group,
+            #                                               SequenceStatus.WAITING,
+            #                                               enable_chunking=True, budget=budget)
+            num_new_seqs = seq_group.get_max_num_running_seqs()
+            temp_sync_stream = []
+            for refilled_group in self.refilled:
+                if(refilled_group.request_id == context_req_id):
+                    context_group = refilled_group
+                    break
+            if(context_group == None):
+                logger.warning("Context Sequence Group Not Found!")
+            else:
+                # print(len(seq_group.get_seqs(SequenceStatus.WAITING)))
+                # print(len(context_group.get_seqs()))
+                assert len(seq_group.get_seqs(SequenceStatus.WAITING)) == 1 and len(context_group.get_seqs()) == 1 
+                # need to update the new sequence group to include its context
+                context_group.set_seq_group_status()
+                context_group.sampling_params = seq_group.sampling_params
+                # print("context_group.sampling_params.logprobs: ",context_group.sampling_params.logprobs)
+                context_seq = context_group.get_seqs(SequenceStatus.WAITING)[0]
+                # print("original input len: ",len(context_seq.inputs['prompt_token_ids']))
+                context_seq.inputs['prompt_token_ids'].extend(context_seq.data._output_token_ids[:-1])
+                # print("plus output length: ",len(context_seq.inputs['prompt_token_ids']))
+                # print("original output last token id: ",context_seq.data._output_token_ids[-1])
+                # print("original output token id: ",context_seq.data._output_token_ids)
+                # print("context_seq.eos_token_id: ",context_seq.eos_token_id)
+                num_computed_tokens = len(context_seq.inputs['prompt_token_ids'])
+                # remainder_last_block = num_computed_tokens % context_seq.block_size
+                # num_computed_tokens -= num_computed_tokens % context_seq.block_size
+                new_seq = seq_group.get_seqs(SequenceStatus.WAITING)[0]
+                # print("new prompt length: ",new_seq.data.get_len())
+                # print("new prompt token id: ",new_seq.data._prompt_token_ids)
+                context_seq.inputs['prompt_token_ids'].extend(new_seq.data._prompt_token_ids[1:])
+                # print("final length: ",len(context_seq.inputs['prompt_token_ids']))
+                # print("original prefix offset: ",context_seq.prefix_offset)
+                # print("original read offset: ",context_seq.read_offset)
+                # # context_seq.prefix_offset += new_seq.data.get_len()-4
+                # print("scheduler prefix offset: ",context_seq.prefix_offset)
+                context_seq.status = SequenceStatus.RUNNING
+                context_seq.stop_reason = None
+                # print("context_seq output_logprobs: ",context_seq.output_logprobs)
+                # context_seq.output_logprobs = context_seq.output_logprobs[:-remainder_last_block]
+                context_seq.output_text = ""
+                context_seq.data = SequenceData(context_seq.inputs["prompt_token_ids"])
+                # print("context_seq inputs token: ",context_seq.inputs["prompt_token_ids"])
+                context_seq.data._num_computed_tokens = num_computed_tokens
+                num_new_tokens = context_seq.get_num_new_tokens()
+                context_seq.read_offset = context_seq.prefix_offset+1
+                context_group.request_id = seq_group.request_id
+                # print("context seq tokens: ",context_seq.tokens)
+                
+                # print("num_new_tokens: ",num_new_tokens)
+                budget.add_num_batched_tokens(seq_group.request_id, num_new_tokens)
+                budget.add_num_seqs(seq_group.request_id, num_new_seqs)
+                # TODO
+                # need to check if it can be allocated later
+                can_allocate = self.block_manager.append_slots_refill(context_seq)
+                if(can_allocate==AllocStatus.LATER):
+                    break
+                if(can_allocate==AllocStatus.NEVER):
+                    logger.warning(
+                    "Input prompt (%d tokens) is too long"
+                    " and exceeds the capacity of block_manager",
+                    num_new_tokens)
+                    context_seq.status = SequenceStatus.FINISHED_IGNORED
+                    ignored_seq_groups.append(context_group)
+                    continue
+                
+                self.running.extend([context_group])
+                refill_seq_groups.append(ScheduledSequenceGroup(seq_group=context_group,token_chunk_size=num_new_tokens))
+                # print("context_seq block table: ",self.block_manager.get_block_table(context_seq))
+                for stream_info in self.stream_in_use:
+                    if(stream_info[1]==context_group.request_id and stream_info[2]==REFILLING):
+                        temp_sync_stream.append(stream_info)
+                        self.stream_list.append(stream_info[0])
+                        
+        self.stream_in_use = [stream_info for stream_info in self.stream_in_use if stream_info not in temp_sync_stream]
+        temp_sync_stream = [stream_info[0] for stream_info in temp_sync_stream]
+        return SchedulerOutputs(
+            scheduled_seq_groups=refill_seq_groups,
+            num_prefill_groups=len(refill_seq_groups),
+            num_batched_tokens=budget.num_batched_tokens,
+            blocks_to_swap_in=[],
+            blocks_to_swap_out=[],
+            blocks_to_kick_out=[],
+            blocks_to_refill=[],
+            kick_out_index=[],
+            refill_index=[],
+            stream_to_sync=temp_sync_stream,
+            kick_out_stream=[],
+            refill_stream=[],
+            blocks_to_copy=[],
+            ignored_seq_groups=ignored_seq_groups,
+            num_lookahead_slots=self._get_num_lookahead_slots(is_prefill=True),
+            running_queue_size=len(self.running),
+            preempted=0,
+        )
+
 
     def schedule(self) -> Tuple[List[SequenceGroupMetadata], SchedulerOutputs]:
         # Schedule sequence groups.
         # This function call changes the internal states of the scheduler
         # such as self.running, self.swapped, and self.waiting.
-        scheduler_outputs = self._schedule()
-        now = time.time()
 
+        scheduler_outputs = None
+        if(len(self.refill_wait)>0 and len(self.context_req_id_ref)>0) and self._passed_delay_refill(time.time()):
+            scheduler_outputs = self.refill_schedule()
+        else: 
+            scheduler_outputs = self._schedule()
+        now = time.time()
+        # if(self.refilling_mode):
+        #     print("scheduler_outputs")
+        # else:
+        #     print("something!!")
         # Create input data structures.
         seq_group_metadata_list: List[SequenceGroupMetadata] = []
         for i, scheduled_seq_group in enumerate(
@@ -1038,10 +1200,24 @@ class Scheduler:
                 seq_data[seq_id] = seq.data
                 block_tables[seq_id] = self.block_manager.get_block_table(seq)
                 self.block_manager.access_all_blocks_in_seq(seq, now)
+                
+                # if(self.refilling_mode):
+                    # print("output text: ",seq.output_text)
+                    # print("output prob log: ",seq.output_logprobs)
+                    # print("computed_length: ",seq.data.get_num_computed_tokens())
+                    # print("uncomputed: ", seq.data.get_num_uncomputed_tokens())
+                    # print("seq length: ",seq.data.get_len())
+                    # print()
+                    
 
             common_computed_block_nums = (
                 self.block_manager.get_common_computed_block_ids(
                     seq_group.get_seqs(status=SequenceStatus.RUNNING)))
+            # if(self.refilling_mode and need_common_computed):
+            #     active_seq = seq_group.get_seqs(status=SequenceStatus.RUNNING)[0]
+            #     num_computed_tokens=active_seq.data.get_num_computed_tokens()
+            #     common_computed_block_nums = (self.block_manager.get_block_table(active_seq))[:(num_computed_tokens//active_seq.block_size)]
+            #     # print("common_computed_block_nums: ",common_computed_block_nums)
 
             do_sample = True
             if seq_group.is_prefill():
@@ -1115,11 +1291,11 @@ class Scheduler:
                     print("Running out of cpu blocks for hanging requests!")
         if(len(self.finished_swapped)> 0 and len(self.refill_requests)> 0):
             while(len(self.refill_requests)> 0):
-                temp_req_id = self.refill_requests.popleft()
+                temp_session_id = self.refill_requests.popleft()
                 temp_seq_group = None
                 find_one = False
                 for seq_group in self.finished_swapped: 
-                    if(seq_group.request_id == temp_req_id):
+                    if(seq_group.session_id == temp_session_id):
                         find_one = True
                         temp_seq_group = seq_group
                         break
@@ -1148,6 +1324,7 @@ class Scheduler:
                         scheduler_outputs.blocks_to_refill.extend(mapping)
                         scheduler_outputs.refill_stream.extend([stream_id])
                         self.refilled.append(seq_group)
+                        self.finished_swapped.remove(temp_seq_group)
                     else:
                         print("Running out of gpu blocks for refill requests!")
                 else:
@@ -1323,6 +1500,22 @@ class Scheduler:
             passed_delay = (
                 (now - earliest_arrival_time) >
                 (self.scheduler_config.delay_factor * self.last_prompt_latency)
+                or not self.running)
+        else:
+            passed_delay = True
+        return passed_delay
+    
+    def _passed_delay_refill(self, now: float) -> bool:
+        if self.prev_prompt_refill:
+            self.last_prompt_latency_refill = now - self.prev_time_refill
+        self.prev_time_refill, self.prev_prompt_refill = now, False
+        # Delay scheduling prompts to let waiting queue fill up
+        if self.scheduler_config.delay_factor > 0 and self.refill_wait:
+            earliest_arrival_time = min(
+                [e.metrics.arrival_time for e in self.refill_wait])
+            passed_delay = (
+                (now - earliest_arrival_time) >
+                (self.scheduler_config.delay_factor * self.last_prompt_latency_refill)
                 or not self.running)
         else:
             passed_delay = True

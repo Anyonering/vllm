@@ -64,6 +64,8 @@ class Worker(LocalOrDistributedWorkerBase):
         self.load_config = load_config
         self.prompt_adapter_config = prompt_adapter_config
         self.is_driver_worker = is_driver_worker
+        self.move_out_cache = []
+        self.move_in_cache = []
         if parallel_config and is_driver_worker:
             assert rank % parallel_config.tensor_parallel_size == 0, \
                    "Driver worker should be rank 0 of tensor parallel group."
@@ -110,6 +112,7 @@ class Worker(LocalOrDistributedWorkerBase):
         self.cache_stream_pool = [torch.cuda.Stream() for i in range(cache_config.num_stream)]
         # the stream pool that are currently in use
         self.stream_in_use = []
+        self.move_out_counter = 0
 
     def init_device(self) -> None:
         if self.device_config.device.type == "cuda":
@@ -273,6 +276,7 @@ class Worker(LocalOrDistributedWorkerBase):
         kick_out_index = torch.tensor(execute_model_req.kick_out_index, device="cpu", dtype=torch.int64)
         refill_stream = torch.tensor(execute_model_req.refill_stream, device="cpu", dtype=torch.int64)
         kick_out_stream = torch.tensor(execute_model_req.kick_out_stream, device="cpu", dtype=torch.int64)
+        stream_to_sync = torch.tensor(execute_model_req.stream_to_sync, device="cpu", dtype=torch.int64)
         # `blocks_to_copy` is a gpu tensor. The src and tgt of
         # blocks to copy are in the same device, and `blocks_to_copy`
         # can be used directly within cuda kernels.
@@ -290,6 +294,7 @@ class Worker(LocalOrDistributedWorkerBase):
             refill_index=refill_index,
             refill_stream=refill_stream,
             kick_out_stream=kick_out_stream,
+            stream_to_sync=stream_to_sync,
             blocks_to_copy=blocks_to_copy,
             virtual_engine=virtual_engine,
         )
@@ -304,7 +309,7 @@ class Worker(LocalOrDistributedWorkerBase):
                 worker_input.blocks_to_swap_in)
         if (worker_input.blocks_to_swap_out is not None
                 and worker_input.blocks_to_swap_out.numel() > 0):
-            print(worker_input.blocks_to_swap_out)
+            # print(worker_input.blocks_to_swap_out)
             self.cache_engine[virtual_engine].swap_out(
                 worker_input.blocks_to_swap_out)
         if (worker_input.blocks_to_copy is not None
@@ -315,26 +320,54 @@ class Worker(LocalOrDistributedWorkerBase):
     def execute_worker_cache(self, worker_input: WorkerInput) -> None:
         virtual_engine = worker_input.virtual_engine
         # Issue cache operations.
+        if (worker_input.blocks_to_kick_out is not None
+                and worker_input.blocks_to_kick_out.numel() > 0):
+            # print("blocks_to_kick_out",worker_input.blocks_to_kick_out)
+            start_pos = 0
+            # print(worker_input.kick_out_index.size(dim=0))
+            for i in range(worker_input.kick_out_index.size(dim=0)):
+                # self.move_out_counter+=1
+                # print("move out counter: ", self.move_out_counter)
+                # if(self.move_out_counter == 2 or self.move_out_counter == 4):
+                #     list_indices = worker_input.blocks_to_kick_out[start_pos:worker_input.kick_out_index[i]][:,0]
+                #     print("move out list indices: ",list_indices)
+                #     for j in range(self.cache_engine[virtual_engine].num_attention_layers):
+                #         # print("gpu caches shape: ",self.gpu_cache[0][j].shape)
+                #         self.move_out_cache.append(self.gpu_cache[0][j][:,list_indices,:].clone().detach()) 
+                #     # print("mvoe out cache: ",self.move_out_cache[0])
+                #     cuda = torch.device('cuda')
+                #     self.cache_stream_pool[worker_input.kick_out_stream[i]].wait_stream(torch.cuda.default_stream(cuda))
+                with torch.cuda.stream(self.cache_stream_pool[worker_input.kick_out_stream[i]]):
+                    # print("kick out stream index: ",worker_input.kick_out_stream[i])
+                    self.cache_engine[virtual_engine].swap_out(
+                        worker_input.blocks_to_kick_out[start_pos:worker_input.kick_out_index[i]])
+                    # print("kicking blocks table: ",worker_input.blocks_to_kick_out[start_pos:worker_input.kick_out_index[i]])
+                start_pos += worker_input.kick_out_index[i]
+        
         if (worker_input.blocks_to_refill is not None
                 and worker_input.blocks_to_refill.numel() > 0):
             print("blocks_to_refill",worker_input.blocks_to_refill)
             start_pos = 0
             for i in range(worker_input.refill_index.size(dim=0)):
                 with torch.cuda.stream(self.cache_stream_pool[worker_input.refill_stream[i]]):
+                    # print("refill stream index: ",worker_input.refill_stream[i])
                     self.cache_engine[virtual_engine].swap_in(
                         worker_input.blocks_to_refill[start_pos:worker_input.refill_index[i]])
+                    print("refilling blocks table: ",worker_input.blocks_to_refill[start_pos:worker_input.refill_index[i]])
                 start_pos += worker_input.refill_index[i]
-                
-        if (worker_input.blocks_to_kick_out is not None
-                and worker_input.blocks_to_kick_out.numel() > 0):
-            print("blocks_to_kick_out",worker_input.blocks_to_kick_out)
-            start_pos = 0
-            print(worker_input.kick_out_index.size(dim=0))
-            for i in range(worker_input.kick_out_index.size(dim=0)):
-                with torch.cuda.stream(self.cache_stream_pool[worker_input.kick_out_stream[i]]):
-                    self.cache_engine[virtual_engine].swap_out(
-                        worker_input.blocks_to_kick_out[start_pos:worker_input.kick_out_index[i]])
-                start_pos += worker_input.kick_out_index[i]
+                # self.cache_stream_pool[worker_input.refill_stream[i]].synchronize()
+                # if(len(self.move_in_cache)==0):
+                #     my_folder = "~/personal/projects/vllm_inference/kv_cache_ref"
+                #     list_indices = worker_input.blocks_to_refill[0:worker_input.refill_index[i]][:,1]
+                #     print("move in list indices: ",list_indices)
+                #     for j in range(self.cache_engine[virtual_engine].num_attention_layers):
+                #         self.move_in_cache.append(self.gpu_cache[0][j][:,list_indices,:].clone().detach())
+                #     for j in range(self.cache_engine[virtual_engine].num_attention_layers):
+                #         print(f"In layer {j}",torch.all(torch.eq(self.move_out_cache[j],self.move_in_cache[j])))
+                #         torch.save(self.move_out_cache[j],f"{my_folder}/worker_cache_{j}.pt")
+        if(worker_input.stream_to_sync is not None and worker_input.stream_to_sync.numel() > 0):
+            for i in worker_input.stream_to_sync:
+                self.cache_stream_pool[i].synchronize()
             
         # if(worker_input.blocks_to_kick_out is not None
         #         and worker_input.blocks_to_kick_out.numel() > 0 and

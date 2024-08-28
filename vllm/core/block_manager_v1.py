@@ -467,6 +467,39 @@ class BlockSpaceManagerV1(BlockSpaceManager):
             block_table[-1] = new_block
             self.gpu_allocator.free(last_block)
             return [(last_block.block_number, new_block.block_number)]
+        
+    def append_slots_refill(self,seq: Sequence,
+        num_lookahead_slots: int = 0,
+    ) -> None:
+        """Allocate physical slots for a sequence with new user prompt tokens."""
+        n_blocks = seq.n_blocks
+        block_table = self.block_tables[seq.seq_id]
+        num_prompt_blocks = seq.n_blocks
+        num_free_blocks = self.gpu_allocator.get_num_free_blocks()
+        status = None
+        # print("original block table: ",block_table)
+        # If we need to allocate a new physical block
+        if len(block_table) < n_blocks:
+            num_blocks_diff = n_blocks - len(block_table)
+        else:
+            return AllocStatus.OK
+        if (self.num_total_gpu_blocks - num_prompt_blocks <
+                self.watermark_blocks):
+            return AllocStatus.NEVER
+        if num_free_blocks - num_blocks_diff >= self.watermark_blocks:
+            status = AllocStatus.OK
+        else:
+            return AllocStatus.LATER
+        
+        # Allocate new physical token blocks that will store the prompt tokens.
+        
+        # block_table: BlockTable = []
+        for logical_idx in range(num_blocks_diff):
+            block = self.gpu_allocator.allocate()
+            # Set the reference counts of the token blocks.
+            block.ref_count = 1
+            block_table.append(block)
+        
 
     def fork(self, parent_seq: Sequence, child_seq: Sequence) -> None:
         # NOTE: fork does not allocate a new physical block.
@@ -526,7 +559,8 @@ class BlockSpaceManagerV1(BlockSpaceManager):
             self, block_table: BlockTable, src_allocator: BlockAllocatorBase,
             dest_allocator: BlockAllocatorBase,
             mapping: Dict[PhysicalTokenBlock,
-                          PhysicalTokenBlock]) -> BlockTable:
+                          PhysicalTokenBlock],
+            is_computed: Optional[bool] = False) -> BlockTable:
         new_block_table = []
 
         for from_block in block_table:
@@ -536,6 +570,7 @@ class BlockSpaceManagerV1(BlockSpaceManager):
             else:
                 to_block = dest_allocator.allocate(
                     from_block.block_hash, from_block.num_hashed_tokens)
+                to_block.computed = is_computed
                 mapping[from_block] = to_block
             new_block_table.append(to_block)
             # Free the source block swapped in to destination.
@@ -579,7 +614,7 @@ class BlockSpaceManagerV1(BlockSpaceManager):
                 self._swap_block_table(self.block_tables[seq.seq_id],
                                        self.cpu_allocator,
                                        self.gpu_allocator,
-                                       mapping)
+                                       mapping,True)
 
         if seq_group.is_encoder_decoder():
             self.cross_block_tables[request_id] = \

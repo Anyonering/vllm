@@ -130,6 +130,7 @@ class WorkerInput:
     refill_index: Optional[torch.Tensor] = None
     kick_out_stream: Optional[torch.Tensor] = None
     refill_stream: Optional[torch.Tensor] = None
+    stream_to_sync: Optional[torch.Tensor] = None
     blocks_to_copy: Optional[torch.Tensor] = None
     virtual_engine: int = 0
 
@@ -152,6 +153,7 @@ class WorkerInput:
             refill_index=tensor_dict.pop("refill_index"),
             kick_out_stream=tensor_dict.pop("kick_out_stream"),
             refill_stream=tensor_dict.pop("refill_stream"),
+            stream_to_sync=tensor_dict.pop("stream_to_sync"),
             blocks_to_copy=tensor_dict.pop("blocks_to_copy"),
             virtual_engine=tensor_dict["virtual_engine"],
         )
@@ -170,6 +172,7 @@ class WorkerInput:
             "kick_out_index": self.kick_out_index,
             "refill_index": self.refill_index,
             "refill_stream":self.refill_stream,
+            "stream_to_sync":self.stream_to_sync,
             "kick_out_stream":self.kick_out_stream,
             "blocks_to_copy": self.blocks_to_copy,
             "virtual_engine": self.virtual_engine,

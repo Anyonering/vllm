@@ -32,7 +32,7 @@ from vllm.prompt_adapter.request import PromptAdapterRequest
 from vllm.sampling_params import SamplingParams
 from vllm.sequence import (EmbeddingSequenceGroupOutput, ExecuteModelRequest,
                            PoolerOutput, SamplerOutput, Sequence,
-                           SequenceGroup, SequenceGroupMetadata,
+                           SequenceGroup, SequenceGroupMetadata, SequenceStage,
                            SequenceStatus)
 from vllm.tracing import (SpanAttributes, SpanKind, extract_trace_context,
                           init_tracer)
@@ -493,6 +493,7 @@ class LLMEngine:
     def _add_processed_request(
         self,
         request_id: str,
+        session_id: int,
         processed_inputs: LLMInputs,
         params: Union[SamplingParams, PoolingParams],
         arrival_time: float,
@@ -536,7 +537,7 @@ class LLMEngine:
             for scheduler in self.scheduler
         ]
         min_cost_scheduler = self.scheduler[costs.index(min(costs))]
-        min_cost_scheduler.add_seq_group(seq_group)
+        min_cost_scheduler.add_seq_group(seq_group, session_id)
 
     def stop_remote_worker_execution_loop(self) -> None:
         self.model_executor.stop_remote_worker_execution_loop()
@@ -575,6 +576,7 @@ class LLMEngine:
     def add_request(
         self,
         request_id: str,
+        session_id: int,
         inputs: PromptInputs,
         params: Union[SamplingParams, PoolingParams],
         arrival_time: Optional[float] = None,
@@ -638,6 +640,7 @@ class LLMEngine:
 
         self._add_processed_request(
             request_id=request_id,
+            session_id=session_id,
             processed_inputs=processed_inputs,
             params=params,
             arrival_time=arrival_time,
@@ -789,6 +792,9 @@ class LLMEngine:
             seq_group = scheduled_seq_group.seq_group
             seq_group.update_num_computed_tokens(
                 scheduled_seq_group.token_chunk_size)
+            # if(seq_group.request_id == '0'):
+            #     print("seq_group stage: ",seq_group.is_prefill())
+            # seq_group.get_seqs()[0].data._stage = SequenceStage.DECODE
             if self.model_config.embedding_mode:
                 self._process_sequence_group_outputs(seq_group, outputs)
                 continue
@@ -886,6 +892,7 @@ class LLMEngine:
                 refill_index=scheduler_outputs.refill_index,
                 kick_out_stream=scheduler_outputs.kick_out_stream,
                 refill_stream=scheduler_outputs.refill_stream,
+                stream_to_sync=scheduler_outputs.stream_to_sync,
                 num_lookahead_slots=scheduler_outputs.num_lookahead_slots,
                 running_queue_size=scheduler_outputs.running_queue_size,
                 finished_requests_ids=finished_requests_ids)
