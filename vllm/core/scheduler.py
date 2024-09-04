@@ -1140,12 +1140,17 @@ class Scheduler:
                 refill_seq_groups.append(ScheduledSequenceGroup(seq_group=context_group,token_chunk_size=num_new_tokens))
                 # print("context_seq block table: ",self.block_manager.get_block_table(context_seq))
                 for stream_info in self.stream_in_use:
-                    if(stream_info[1]==context_group.request_id and stream_info[2]==REFILLING):
+                    if(stream_info[1]==context_group.session_id):
                         temp_sync_stream.append(stream_info)
                         self.stream_list.append(stream_info[0])
                         
         self.stream_in_use = [stream_info for stream_info in self.stream_in_use if stream_info not in temp_sync_stream]
         temp_sync_stream = [stream_info[0] for stream_info in temp_sync_stream]
+        print("temp_sync_stream: ",temp_sync_stream)
+        print("length of scheduled refilled seq_group: ",len(refill_seq_groups))
+        # print("-----------------\n------------\n\n-----------\n\n---------")
+        if(len(refill_seq_groups)> 0):
+            self.prev_prompt_refill = True
         return SchedulerOutputs(
             scheduled_seq_groups=refill_seq_groups,
             num_prefill_groups=len(refill_seq_groups),
@@ -1166,7 +1171,6 @@ class Scheduler:
             preempted=0,
         )
 
-
     def schedule(self) -> Tuple[List[SequenceGroupMetadata], SchedulerOutputs]:
         # Schedule sequence groups.
         # This function call changes the internal states of the scheduler
@@ -1175,6 +1179,8 @@ class Scheduler:
         scheduler_outputs = None
         if(len(self.refill_wait)>0 and len(self.context_req_id_ref)>0) and self._passed_delay_refill(time.time()):
             scheduler_outputs = self.refill_schedule()
+            if(len(scheduler_outputs.scheduled_seq_groups)== 0):
+                scheduler_outputs = self._schedule()
         else: 
             scheduler_outputs = self._schedule()
         now = time.time()
@@ -1183,6 +1189,7 @@ class Scheduler:
         # else:
         #     print("something!!")
         # Create input data structures.
+        # print("length of scheduled seq groups: ",len(scheduler_outputs.scheduled_seq_groups))
         seq_group_metadata_list: List[SequenceGroupMetadata] = []
         for i, scheduled_seq_group in enumerate(
                 scheduler_outputs.scheduled_seq_groups):
@@ -1285,7 +1292,7 @@ class Scheduler:
                     scheduler_outputs.kick_out_index.extend([len(mapping)])
                     scheduler_outputs.blocks_to_kick_out.extend(mapping)
                     scheduler_outputs.kick_out_stream.extend([stream_id])
-                    self.stream_in_use.append((stream_id,seq_group.request_id,KICKING))
+                    self.stream_in_use.append((stream_id,seq_group.session_id,KICKING))
                     self.finished_swapped.append(seq_group)
                 else:
                     print("Running out of cpu blocks for hanging requests!")
@@ -1306,7 +1313,7 @@ class Scheduler:
                         has_finished_kick = True
                         index_to_pop = None
                         for stream_info in self.stream_in_use:
-                            if(stream_info[1]==seq_group.request_id and stream_info[2]==KICKING):
+                            if(stream_info[1]==seq_group.session_id and stream_info[2]==KICKING):
                                 stream_id = stream_info[0]
                                 has_finished_kick = False
                                 index_to_pop = self.stream_in_use.index(stream_info)
@@ -1319,7 +1326,7 @@ class Scheduler:
                         else:
                             self.stream_in_use.pop(index_to_pop)
                             
-                        self.stream_in_use.append((stream_id,seq_group.request_id,REFILLING))
+                        self.stream_in_use.append((stream_id,seq_group.session_id,REFILLING))
                         scheduler_outputs.refill_index.extend([len(mapping)])
                         scheduler_outputs.blocks_to_refill.extend(mapping)
                         scheduler_outputs.refill_stream.extend([stream_id])
