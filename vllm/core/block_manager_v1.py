@@ -468,8 +468,7 @@ class BlockSpaceManagerV1(BlockSpaceManager):
             self.gpu_allocator.free(last_block)
             return [(last_block.block_number, new_block.block_number)]
         
-    def append_slots_refill(self,seq: Sequence,
-        num_lookahead_slots: int = 0,
+    def append_slots_refill(self,seq: Sequence, max_num_blocks:int,
     ) -> None:
         """Allocate physical slots for a sequence with new user prompt tokens."""
         n_blocks = seq.n_blocks
@@ -481,6 +480,9 @@ class BlockSpaceManagerV1(BlockSpaceManager):
         # If we need to allocate a new physical block
         if len(block_table) < n_blocks:
             num_blocks_diff = n_blocks - len(block_table)
+            num_blocks_diff = min(num_blocks_diff,max_num_blocks-len(block_table))
+            if(num_blocks_diff<=0):
+                return AllocStatus.OK
         else:
             return AllocStatus.OK
         if (self.num_total_gpu_blocks - num_prompt_blocks <
@@ -499,7 +501,7 @@ class BlockSpaceManagerV1(BlockSpaceManager):
             # Set the reference counts of the token blocks.
             block.ref_count = 1
             block_table.append(block)
-        
+        return status
 
     def fork(self, parent_seq: Sequence, child_seq: Sequence) -> None:
         # NOTE: fork does not allocate a new physical block.
@@ -675,7 +677,19 @@ class BlockSpaceManagerV1(BlockSpaceManager):
 
         return [(cpu_block.block_number, gpu_block.block_number)
                 for cpu_block, gpu_block in mapping.items()]
+        
+    def truncate_first_append_last(self, seq: Sequence):
+        block_table = self.block_tables[seq.seq_id]
+        first_block = block_table.pop(0)
+        block_table.append(first_block)
 
+    def truncate_blocks(self, seq: Sequence, num:int):
+        block_table = self.block_tables[seq.seq_id]
+        assert num < len(block_table)
+        first_part = block_table[:num]
+        block_table = block_table[num:]
+        block_table.extend(first_part)
+        
     def _free_block_table(self, block_table: BlockTable) -> None:
         # when using a sliding window, each seq will only use up
         # to `self.block_sliding_window` blocks. When freeing

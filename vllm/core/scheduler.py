@@ -2,6 +2,7 @@ import enum
 import os
 import random
 import time
+import math
 from collections import deque
 from dataclasses import dataclass, field
 from typing import Deque, Dict, Iterable, List, Optional, Set, Tuple, Union
@@ -378,6 +379,7 @@ class Scheduler:
                                        else 0)
         self.num_cumulative_preemption: int = 0
         self.cumulative_session_id = -1
+        self.use_truncation = True
 
     @property
     def lora_enabled(self) -> bool:
@@ -520,6 +522,23 @@ class Scheduler:
                 break
 
             running_queue.popleft()
+            first_seq = seq_group.get_seqs(SequenceStatus.RUNNING)[0]
+            if(first_seq.truncated):
+                # need to handle truncated sequence differently
+                is_prefill = seq_group.is_prefill()
+                if is_prefill:
+                    prefill_seq_groups.append(
+                        ScheduledSequenceGroup(
+                            seq_group=seq_group,
+                            token_chunk_size=num_running_tokens))
+                else:
+                    decode_seq_groups.append(
+                        ScheduledSequenceGroup(seq_group=seq_group,
+                                               token_chunk_size=1))
+                budget.add_num_batched_tokens(seq_group.request_id,
+                                              num_running_tokens)
+                continue
+            
             while not self._can_append_slots(seq_group):
                 budget.subtract_num_batched_tokens(seq_group.request_id,
                                                    num_running_tokens)
@@ -1073,6 +1092,7 @@ class Scheduler:
             #                                               enable_chunking=True, budget=budget)
             num_new_seqs = seq_group.get_max_num_running_seqs()
             temp_sync_stream = []
+            sampling_params = seq_group.sampling_params
             for refilled_group in self.refilled:
                 if(refilled_group.request_id == context_req_id):
                     context_group = refilled_group
@@ -1115,16 +1135,18 @@ class Scheduler:
                 # print("context_seq inputs token: ",context_seq.inputs["prompt_token_ids"])
                 context_seq.data._num_computed_tokens = num_computed_tokens
                 num_new_tokens = context_seq.get_num_new_tokens()
+                context_seq.tokens.pop()
+                context_seq.tokens.extend(new_seq.inputs['prompt'])
                 context_seq.read_offset = context_seq.prefix_offset+1
                 context_group.request_id = seq_group.request_id
                 # print("context seq tokens: ",context_seq.tokens)
-                
                 # print("num_new_tokens: ",num_new_tokens)
                 budget.add_num_batched_tokens(seq_group.request_id, num_new_tokens)
                 budget.add_num_seqs(seq_group.request_id, num_new_seqs)
+                max_num_block = math.ceil(sampling_params.max_tokens/context_seq.block_size)
                 # TODO
                 # need to check if it can be allocated later
-                can_allocate = self.block_manager.append_slots_refill(context_seq)
+                can_allocate = self.block_manager.append_slots_refill(context_seq,max_num_blocks=max_num_block)
                 if(can_allocate==AllocStatus.LATER):
                     break
                 if(can_allocate==AllocStatus.NEVER):
@@ -1136,6 +1158,19 @@ class Scheduler:
                     ignored_seq_groups.append(context_group)
                     continue
                 
+                # need to check if prompt becomes too long
+                # if so, we need to truncate some part from it
+                if(context_seq.data.get_len()>sampling_params.max_tokens):
+                    print("hitting here \nhitting here \nhitting here \n")
+                    cur_len = context_seq.data.get_len()
+                    num_blocks_truncated = math.ceil((cur_len - sampling_params.max_tokens)/context_seq.block_size)
+                    self.block_manager.truncate_blocks(seq=context_seq,num=num_blocks_truncated)
+                    num_tokens_truncated = num_blocks_truncated * context_seq.block_size
+                    context_seq.data.truncated_len += num_tokens_truncated
+                    context_seq.truncated = True
+                    context_seq.read_offset -= num_tokens_truncated
+                    context_seq.prefix_offset -= num_tokens_truncated
+                    context_seq.data._num_computed_tokens -= num_tokens_truncated
                 self.running.extend([context_group])
                 refill_seq_groups.append(ScheduledSequenceGroup(seq_group=context_group,token_chunk_size=num_new_tokens))
                 # print("context_seq block table: ",self.block_manager.get_block_table(context_seq))
@@ -1170,12 +1205,27 @@ class Scheduler:
             running_queue_size=len(self.running),
             preempted=0,
         )
+    def process_truncated_seqs(self)-> None:
+        for seq_group in self.running:
+            truncated_seqs = seq_group.get_seqs(SequenceStatus.TRUNCATED)
+            if(truncated_seqs is None or len(truncated_seqs)==0):
+                return
+            else:
+                for truncated_seq in truncated_seqs:
+                    self.block_manager.truncate_first_append_last(truncated_seq)
+                    truncated_seq.status = SequenceStatus.RUNNING
+                    truncated_seq.truncated = True
+                    truncated_seq.read_offset -= truncated_seq.block_size
+                    truncated_seq.prefix_offset -= truncated_seq.block_size
 
     def schedule(self) -> Tuple[List[SequenceGroupMetadata], SchedulerOutputs]:
         # Schedule sequence groups.
         # This function call changes the internal states of the scheduler
         # such as self.running, self.swapped, and self.waiting.
-
+        
+        # need to handle truncated sequences first
+        if(self.use_truncation):
+            self.process_truncated_seqs()
         scheduler_outputs = None
         if(len(self.refill_wait)>0 and len(self.context_req_id_ref)>0) and self._passed_delay_refill(time.time()):
             scheduler_outputs = self.refill_schedule()

@@ -795,6 +795,7 @@ class SchedulerConfig:
         self.chunked_prefill_enabled = enable_chunked_prefill
         self.embedding_mode = embedding_mode
         self.preemption_mode = preemption_mode
+        self.use_truncation = True
         self._verify_args()
 
     def _verify_args(self) -> None:

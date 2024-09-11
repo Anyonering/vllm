@@ -6,7 +6,7 @@ from vllm.lora.request import LoRARequest
 from vllm.sampling_params import SamplingParams
 from vllm.sequence import Sequence, SequenceStatus
 
-
+BLOCK_SIZE = 16
 class StopChecker:
     """LLMEngine helper class which separates out the logic involving stop
     checking. This checks things such as: whether the eos token was emitted,
@@ -14,12 +14,13 @@ class StopChecker:
     emitted, or if we have exceeded the max model len.
     """
 
-    def __init__(self, max_model_len: int,
+    def __init__(self, max_model_len: int, use_truncation: bool,
                  get_tokenizer_for_seq: Callable[[Sequence],
                                                  PreTrainedTokenizer]):
         # Do not use it directly, but use `self._get_max_model_len`.
         self._max_model_len = max_model_len
         self.get_tokenizer_for_seq = get_tokenizer_for_seq
+        self.use_truncation = use_truncation
 
     def _get_max_model_len(self, lora_req: Optional[LoRARequest]):
         if lora_req and lora_req.long_lora_max_len:
@@ -54,6 +55,10 @@ class StopChecker:
                     not sampling_params.include_stop_str_in_output):
                 seq.output_text = seq.output_text[:-new_char_count]
             seq.status = SequenceStatus.FINISHED_STOPPED
+            print("seq real length: ",seq.data.get_real_len())
+            if(seq.truncated):
+                # print("last part token: ",seq.tokens[-seq.data.get_len():])
+                print("not truncated part : ",seq.tokens[:seq.data.get_real_len()-seq.data.get_len()])
             return
 
         # Check if a stop token was encountered.
@@ -66,6 +71,10 @@ class StopChecker:
                 seq.output_text = seq.output_text[:-new_char_count]
             seq.status = SequenceStatus.FINISHED_STOPPED
             seq.stop_reason = last_token_id
+            print("seq real length: ",seq.data.get_real_len())
+            if(seq.truncated):
+                #print("last part token: ",seq.tokens[-seq.data.get_len():])
+                print("not truncated part : ",seq.tokens[:seq.data.get_real_len()-seq.data.get_len()])
             return
 
         # Check if any stop strings are matched.
@@ -76,15 +85,37 @@ class StopChecker:
             seq.stop_reason = stop_str
             return
 
-        # Check if the sequence has reached max_model_len.
-        if seq.get_len() > self._get_max_model_len(lora_req):
-            seq.status = SequenceStatus.FINISHED_LENGTH_CAPPED
-            return
+        if(self.use_truncation):
+            if(seq.data.get_real_len() >= sampling_params.max_tokens and seq.get_len()%seq.block_size == 0 and 
+               seq.data.get_real_len() < 2* sampling_params.max_tokens):
+                # assuming max tokens is the multiple of block_size
+                # need to allocate the first block in the sequence as the 
+                # the new one to avoid using too many resources
+                seq.status = SequenceStatus.TRUNCATED
+                seq.truncated = True
+                seq.data.truncated_len +=seq.block_size
+                return
+            else:
+                if(seq.data.get_real_len()>=2* sampling_params.max_tokens):
+                    seq.status = SequenceStatus.FINISHED_LENGTH_CAPPED
+                    print("seq real length: ",seq.data.get_real_len())
+                    if(seq.truncated):
+                        print("not truncated part : ",seq.tokens[:seq.data.get_real_len()-seq.data.get_len()])
+                    return
+        else: 
+            if(seq.data.get_real_len()>=2* sampling_params.max_tokens):
+                seq.status = SequenceStatus.FINISHED_LENGTH_CAPPED
+                return
+            
+            # Check if the sequence has reached max_model_len.
+            if seq.get_len() > self._get_max_model_len(lora_req):
+                seq.status = SequenceStatus.FINISHED_LENGTH_CAPPED
+                return
 
-        # Check if the sequence has reached max_tokens.
-        if seq.get_output_len() == sampling_params.max_tokens:
-            seq.status = SequenceStatus.FINISHED_LENGTH_CAPPED
-            return
+            # Check if the sequence has reached max_tokens.
+            if seq.get_output_len() == sampling_params.max_tokens:
+                seq.status = SequenceStatus.FINISHED_LENGTH_CAPPED
+                return
 
     @staticmethod
     def _check_stop_strings(seq: Sequence, new_char_count: int,

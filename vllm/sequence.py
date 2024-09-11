@@ -52,6 +52,7 @@ class SequenceStatus(enum.IntEnum):
     FINISHED_LENGTH_CAPPED = 4
     FINISHED_ABORTED = 5
     FINISHED_IGNORED = 6
+    TRUNCATED = -1
 
     @staticmethod
     def is_finished(status: "SequenceStatus") -> bool:
@@ -127,6 +128,7 @@ class SequenceData:
         # The number of tokens that are computed (that run against the model).
         self._num_computed_tokens = 0
         self._stage: SequenceStage = SequenceStage.PREFILL
+        self.truncated_len = 0
 
         self._update_cached_all_tokens()
 
@@ -159,6 +161,9 @@ class SequenceData:
         self.cumulative_logprob += logprob
 
     def get_len(self) -> int:
+        return len(self._output_token_ids) + len(self._prompt_token_ids) - self.truncated_len
+    
+    def get_real_len(self) -> int:
         return len(self._output_token_ids) + len(self._prompt_token_ids)
 
     def get_prompt_len(self) -> int:
@@ -188,8 +193,8 @@ class SequenceData:
     def update_num_computed_tokens(self, num_new_computed_tokens: int):
         """Update number of tokens computed so far."""
         self._num_computed_tokens += num_new_computed_tokens
-        assert self._num_computed_tokens <= self.get_len(), (
-            self._num_computed_tokens, self.get_len())
+        assert self._num_computed_tokens <= self.get_real_len(), (
+            self._num_computed_tokens, self.get_real_len())
         # If all tokens are computed, it means it is in decoding phase.
         if self.get_num_uncomputed_tokens() == 0:
             self._stage = SequenceStage.DECODE
@@ -273,6 +278,8 @@ class Sequence:
         self.read_offset = 0
         # Input + output tokens
         self.tokens: Optional[List[str]] = None
+        self.truncated_part = []
+        self.truncated = False
 
     @property
     def n_blocks(self) -> int:
