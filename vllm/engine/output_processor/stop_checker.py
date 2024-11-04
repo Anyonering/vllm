@@ -43,9 +43,9 @@ class StopChecker:
 
         # Check if the minimum number of tokens has been generated yet;
         # skip the stop string/token checks if not
-        if seq.get_output_len() < sampling_params.min_tokens:
+        if seq.get_output_len() < sampling_params.min_tokens and seq.data.truncated_len == 0:
             return
-
+        
         # Check if the sequence has generated the EOS token.
         if ((not sampling_params.ignore_eos)
                 and seq.get_last_token_id() == seq.eos_token_id):
@@ -58,7 +58,7 @@ class StopChecker:
             print("seq real length: ",seq.data.get_real_len())
             if(seq.truncated):
                 # print("last part token: ",seq.tokens[-seq.data.get_len():])
-                print("not truncated part : ",seq.tokens[:seq.data.get_real_len()-seq.data.get_len()])
+                print("not truncated part : ",seq.tokens[:min(seq.data.get_real_len()-seq.data.get_len(),100)])
             return
 
         # Check if a stop token was encountered.
@@ -74,7 +74,7 @@ class StopChecker:
             print("seq real length: ",seq.data.get_real_len())
             if(seq.truncated):
                 #print("last part token: ",seq.tokens[-seq.data.get_len():])
-                print("not truncated part : ",seq.tokens[:seq.data.get_real_len()-seq.data.get_len()])
+                print("not truncated part : ",seq.tokens[:min(seq.data.get_real_len()-seq.data.get_len(),100)])
             return
 
         # Check if any stop strings are matched.
@@ -87,7 +87,7 @@ class StopChecker:
 
         if(self.use_truncation):
             if(seq.data.get_real_len() >= sampling_params.max_tokens and seq.get_len()%seq.block_size == 0 and 
-               seq.data.get_real_len() < 2* sampling_params.max_tokens):
+               seq.data.get_output_len() < sampling_params.max_tokens):
                 # assuming max tokens is the multiple of block_size
                 # need to allocate the first block in the sequence as the 
                 # the new one to avoid using too many resources
@@ -96,12 +96,13 @@ class StopChecker:
                 seq.data.truncated_len +=seq.block_size
                 return
             else:
-                if(seq.data.get_real_len()>=2* sampling_params.max_tokens):
+                if(seq.data.get_output_len()>= sampling_params.max_tokens):
                     seq.status = SequenceStatus.FINISHED_LENGTH_CAPPED
                     print("seq real length: ",seq.data.get_real_len())
                     if(seq.truncated):
-                        print("not truncated part : ",seq.tokens[:seq.data.get_real_len()-seq.data.get_len()])
+                        print("not truncated part : ",seq.tokens[:min(seq.data.get_real_len()-seq.data.get_len(),100)])
                     return
+                
         else: 
             if(seq.data.get_real_len()>=2* sampling_params.max_tokens):
                 seq.status = SequenceStatus.FINISHED_LENGTH_CAPPED

@@ -346,7 +346,7 @@ class Worker(LocalOrDistributedWorkerBase):
         
         if (worker_input.blocks_to_refill is not None
                 and worker_input.blocks_to_refill.numel() > 0):
-            print("blocks_to_refill",worker_input.blocks_to_refill)
+            # print("blocks_to_refill",worker_input.blocks_to_refill)
             print("worker input refill stream: ",worker_input.refill_stream)
             print("refill index: ",worker_input.refill_index)
             start_pos = 0
@@ -355,7 +355,7 @@ class Worker(LocalOrDistributedWorkerBase):
                     # print("refill stream index: ",worker_input.refill_stream[i])
                     self.cache_engine[virtual_engine].swap_in(
                         worker_input.blocks_to_refill[start_pos:start_pos+worker_input.refill_index[i]])
-                    print("refilling blocks table: ",worker_input.blocks_to_refill[start_pos:start_pos+worker_input.refill_index[i]])
+                    # print("refilling blocks table: ",worker_input.blocks_to_refill[start_pos:start_pos+worker_input.refill_index[i]])
                 start_pos += worker_input.refill_index[i]
                 # self.cache_stream_pool[worker_input.refill_stream[i]].synchronize()
                 # if(len(self.move_in_cache)==0):

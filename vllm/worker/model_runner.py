@@ -530,11 +530,11 @@ class GPUModelRunnerBase(ModelRunnerBase[TModelInputForGPU]):
                 query_len = sliding_seq_len - sliding_context_len
                 query_lens.append(query_len)
                 input_tokens.extend(tokens)
-                if(seq_data.truncated_len==0):
-                    input_positions.extend(list(range(context_len, seq_len)))
-                else:
-                    # print("getting here")
-                    input_positions.extend(list(range(context_len+seq_data.truncated_len, seq_len+seq_data.truncated_len)))
+                # if(seq_data.truncated_len==0):
+                input_positions.extend(list(range(context_len, seq_len)))
+                # else:
+                #     # print("getting here")
+                #     input_positions.extend(list(range(context_len+seq_data.truncated_len, seq_len+seq_data.truncated_len)))
                 lora_id = seq_group_metadata.lora_int_id
                 prompt_adapter_id = seq_group_metadata.prompt_adapter_id
 
@@ -617,10 +617,13 @@ class GPUModelRunnerBase(ModelRunnerBase[TModelInputForGPU]):
                     if i < start_idx:
                         slot_mapping.append(_PAD_SLOT_ID)
                         continue
-                    # print("i: ",i)
-                    # print("context length: ",context_len)
-                    # print("sequence length: ",seq_len)
-                    # print("block table len: ",len(block_table))
+                    if(i // self.block_size) >= len(block_table):
+                        print("i: ",i)
+                        print("context length: ",context_len)
+                        print("sequence length: ",seq_len)
+                        print("block table len: ",len(block_table))
+                        print("sequence real length: ", seq_data.get_real_len())
+                        print("sequence length: ", seq_data.get_len())
                     
                     block_number = block_table[i // self.block_size]
                     block_offset = i % self.block_size

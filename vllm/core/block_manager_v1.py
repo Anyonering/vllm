@@ -687,8 +687,8 @@ class BlockSpaceManagerV1(BlockSpaceManager):
         block_table = self.block_tables[seq.seq_id]
         assert num < len(block_table)
         first_part = block_table[:num]
-        block_table = block_table[num:]
-        block_table.extend(first_part)
+        self.block_tables[seq.seq_id] = block_table[num:]
+        self.block_tables[seq.seq_id].extend(first_part)
         
     def _free_block_table(self, block_table: BlockTable) -> None:
         # when using a sliding window, each seq will only use up

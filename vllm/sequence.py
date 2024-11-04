@@ -467,6 +467,7 @@ class SequenceGroup:
         self.encoder_seq = encoder_seq
         self.trace_headers = trace_headers
         self.session_id = session_id
+        self.is_last_round = False
 
     @property
     def prompt(self) -> Optional[str]:
