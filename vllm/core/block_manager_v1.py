@@ -593,6 +593,11 @@ class BlockSpaceManagerV1(BlockSpaceManager):
 
         return [(cpu_block.block_number, gpu_block.block_number)
                 for cpu_block, gpu_block in mapping.items()]
+        
+    def truncate_first_append_last(self, seq: Sequence):
+        block_table = self.block_tables[seq.seq_id]
+        first_block = block_table.pop(0)
+        block_table.append(first_block)
 
     def _free_block_table(self, block_table: BlockTable) -> None:
         # when using a sliding window, each seq will only use up

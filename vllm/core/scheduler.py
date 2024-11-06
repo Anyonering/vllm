@@ -330,6 +330,7 @@ class Scheduler:
                                        if self.enable_artificial_preemption
                                        else 0)
         self.num_cumulative_preemption: int = 0
+        self.use_truncation = True
 
     @property
     def lora_enabled(self) -> bool:
@@ -446,6 +447,22 @@ class Scheduler:
                 break
 
             running_queue.popleft()
+            first_seq = seq_group.get_seqs(SequenceStatus.RUNNING)[0]
+            if(first_seq.truncated):
+                # need to handle truncated sequence differently
+                is_prefill = seq_group.is_prefill()
+                if is_prefill:
+                    prefill_seq_groups.append(
+                        ScheduledSequenceGroup(
+                            seq_group=seq_group,
+                            token_chunk_size=num_running_tokens))
+                else:
+                    decode_seq_groups.append(
+                        ScheduledSequenceGroup(seq_group=seq_group,
+                                               token_chunk_size=1))
+                budget.add_num_batched_tokens(seq_group.request_id,
+                                              num_running_tokens)
+                continue
             while not self._can_append_slots(seq_group):
                 budget.subtract_num_batched_tokens(seq_group.request_id,
                                                    num_running_tokens)
@@ -969,11 +986,27 @@ class Scheduler:
             seq_group=seq_group,
             num_lookahead_slots=self._get_num_lookahead_slots(is_prefill),
         )
+        
+    def process_truncated_seqs(self)-> None:
+        for seq_group in self.running:
+            truncated_seqs = seq_group.get_seqs(SequenceStatus.TRUNCATED)
+            if(truncated_seqs is None or len(truncated_seqs)==0):
+                continue
+            else:
+                for truncated_seq in truncated_seqs:
+                    self.block_manager.truncate_first_append_last(truncated_seq)
+                    truncated_seq.status = SequenceStatus.RUNNING
+                    truncated_seq.truncated = True
+                    truncated_seq.data._num_computed_tokens -= truncated_seq.block_size
+                    truncated_seq.read_offset -= truncated_seq.block_size
+                    truncated_seq.prefix_offset -= truncated_seq.block_size
 
     def schedule(self) -> Tuple[List[SequenceGroupMetadata], SchedulerOutputs]:
         # Schedule sequence groups.
         # This function call changes the internal states of the scheduler
         # such as self.running, self.swapped, and self.waiting.
+        if(self.use_truncation):
+            self.process_truncated_seqs()
         scheduler_outputs = self._schedule()
         now = time.time()
 
