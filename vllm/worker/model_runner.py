@@ -526,6 +526,12 @@ class GPUModelRunnerBase(ModelRunnerBase[TModelInputForGPU]):
                 query_lens.append(query_len)
                 input_tokens.extend(tokens)
                 input_positions.extend(list(range(context_len, seq_len)))
+                if(seq_len-1 >=2048):
+                    print(f"input_positions: {input_positions}")
+                    print(f"context len: {sliding_context_len}")
+                    print(f"query len: {query_len}")
+                    print(f" input tokens: {tokens} \n with length {len(tokens)}")
+                    print("Seq len out of range!\n\n\nSeq len out of range!\n\n\n")
                 lora_id = seq_group_metadata.lora_int_id
                 prompt_adapter_id = seq_group_metadata.prompt_adapter_id
 

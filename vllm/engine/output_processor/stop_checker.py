@@ -44,7 +44,7 @@ class StopChecker:
 
         # Check if the minimum number of tokens has been generated yet;
         # skip the stop string/token checks if not
-        if seq.get_output_len() < sampling_params.min_tokens:
+        if seq.get_output_len() < sampling_params.min_tokens and seq.data.get_real_len()<sampling_params.max_tokens-1:
             return
 
         # Check if the sequence has generated the EOS token.

@@ -187,3 +187,5 @@ hip_compat.h
 
 # Benchmark dataset
 *.json
+grpc/chat_pb2.pyi
+grpc/test_tokenizer.ipynb
