@@ -398,6 +398,7 @@ class Scheduler:
         self.refill_info_dict: Dict[int, SeqGroupBlockInfo] = {}
         self.pend_refill: List[SeqGroupWCounter] = list()
         self.is_finish_dict = {}
+        self.time_in_scheduler = 0
 
     @property
     def lora_enabled(self) -> bool:
@@ -1302,7 +1303,7 @@ class Scheduler:
         # Schedule sequence groups.
         # This function call changes the internal states of the scheduler
         # such as self.running, self.swapped, and self.waiting.
-        
+        schedule_begin = time.time()
         # need to handle truncated sequences first
         if(self.use_truncation):
             self.process_truncated_seqs()
@@ -1489,6 +1490,7 @@ class Scheduler:
         # if(len(scheduler_outputs.blocks_to_refill)>0):
         #     print("blocks to refill: ",scheduler_outputs.blocks_to_refill)
         self.count_down_pending_refill()
+        self.time_in_scheduler +=time.time()-schedule_begin
         return seq_group_metadata_list, scheduler_outputs
 
     def count_down_pending_refill(self) -> None:
