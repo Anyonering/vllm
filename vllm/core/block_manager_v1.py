@@ -467,6 +467,48 @@ class BlockSpaceManagerV1(BlockSpaceManager):
             block_table[-1] = new_block
             self.gpu_allocator.free(last_block)
             return [(last_block.block_number, new_block.block_number)]
+        
+    def truncate_blocks(self, seq: Sequence, num:int):
+        block_table = self.block_tables[seq.seq_id]
+        assert num < len(block_table)
+        first_part = block_table[:num]
+        self.block_tables[seq.seq_id] = block_table[num:]
+        self.block_tables[seq.seq_id].extend(first_part)
+        
+    def append_slots_refill(self,seq: Sequence, max_num_blocks:int,
+    ) -> None:
+        """Allocate physical slots for a sequence with new user prompt tokens."""
+        n_blocks = seq.n_blocks
+        block_table = self.block_tables[seq.seq_id]
+        num_prompt_blocks = seq.n_blocks
+        num_free_blocks = self.gpu_allocator.get_num_free_blocks()
+        status = None
+        # print("original block table: ",block_table)
+        # If we need to allocate a new physical block
+        if len(block_table) < n_blocks:
+            num_blocks_diff = n_blocks - len(block_table)
+            num_blocks_diff = min(num_blocks_diff,max_num_blocks-len(block_table))
+            if(num_blocks_diff<=0):
+                return AllocStatus.OK
+        else:
+            return AllocStatus.OK
+        if (self.num_total_gpu_blocks - num_prompt_blocks <
+                self.watermark_blocks):
+            return AllocStatus.NEVER
+        if num_free_blocks - num_blocks_diff >= self.watermark_blocks:
+            status = AllocStatus.OK
+        else:
+            return AllocStatus.LATER
+        
+        # Allocate new physical token blocks that will store the prompt tokens.
+        
+        # block_table: BlockTable = []
+        for logical_idx in range(num_blocks_diff):
+            block = self.gpu_allocator.allocate()
+            # Set the reference counts of the token blocks.
+            block.ref_count = 1
+            block_table.append(block)
+        return status
 
     def fork(self, parent_seq: Sequence, child_seq: Sequence) -> None:
         # NOTE: fork does not allocate a new physical block.

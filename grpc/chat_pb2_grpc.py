@@ -39,12 +39,23 @@ class LlmEngineStub(object):
                 request_serializer=chat__pb2.ChatReq.SerializeToString,
                 response_deserializer=chat__pb2.ChatResp.FromString,
                 _registered_method=True)
+        self.processInfoReq = channel.unary_unary(
+                '/ChatVllm.LlmEngine/processInfoReq',
+                request_serializer=chat__pb2.InfoReq.SerializeToString,
+                response_deserializer=chat__pb2.InfoResp.FromString,
+                _registered_method=True)
 
 
 class LlmEngineServicer(object):
     """Missing associated documentation comment in .proto file."""
 
     def processChatReq(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def processInfoReq(self, request, context):
         """Missing associated documentation comment in .proto file."""
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
@@ -57,6 +68,11 @@ def add_LlmEngineServicer_to_server(servicer, server):
                     servicer.processChatReq,
                     request_deserializer=chat__pb2.ChatReq.FromString,
                     response_serializer=chat__pb2.ChatResp.SerializeToString,
+            ),
+            'processInfoReq': grpc.unary_unary_rpc_method_handler(
+                    servicer.processInfoReq,
+                    request_deserializer=chat__pb2.InfoReq.FromString,
+                    response_serializer=chat__pb2.InfoResp.SerializeToString,
             ),
     }
     generic_handler = grpc.method_handlers_generic_handler(
@@ -86,6 +102,33 @@ class LlmEngine(object):
             '/ChatVllm.LlmEngine/processChatReq',
             chat__pb2.ChatReq.SerializeToString,
             chat__pb2.ChatResp.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def processInfoReq(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/ChatVllm.LlmEngine/processInfoReq',
+            chat__pb2.InfoReq.SerializeToString,
+            chat__pb2.InfoResp.FromString,
             options,
             channel_credentials,
             insecure,

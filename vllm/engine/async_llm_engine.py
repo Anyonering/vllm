@@ -296,6 +296,7 @@ class _AsyncLLMEngine(LLMEngine):
     async def add_request_async(
             self,
             request_id: str,
+            session_id: int,
             inputs: PromptInputs,
             params: Union[SamplingParams, PoolingParams],
             arrival_time: Optional[float] = None,
@@ -317,6 +318,7 @@ class _AsyncLLMEngine(LLMEngine):
 
         self._add_processed_request(
             request_id=request_id,
+            session_id=session_id,
             processed_inputs=processed_inputs,
             params=params,
             arrival_time=arrival_time,
@@ -637,6 +639,7 @@ class AsyncLLMEngine:
     async def add_request(
         self,
         request_id: str,
+        session_id: int,
         inputs: PromptInputs,
         params: Union[SamplingParams, PoolingParams],
         arrival_time: Optional[float] = None,
@@ -680,6 +683,7 @@ class AsyncLLMEngine:
 
         stream = self._request_tracker.add_request(
             request_id,
+            session_id=session_id,
             inputs=inputs,
             params=params,
             arrival_time=arrival_time,
@@ -696,7 +700,8 @@ class AsyncLLMEngine:
         request_id: str,
         lora_request: Optional[LoRARequest] = None,
         trace_headers: Optional[Dict[str, str]] = None,
-        prompt_adapter_request: Optional[PromptAdapterRequest] = None
+        prompt_adapter_request: Optional[PromptAdapterRequest] = None,
+        session_id: Optional[int] = None
     ) -> AsyncIterator[RequestOutput]:
         """Generate outputs for a request.
 
@@ -762,8 +767,11 @@ class AsyncLLMEngine:
             >>> # Process and return the final output
             >>> ...
         """
+        if(session_id is None):
+            session_id = self.engine.scheduler[0].get_new_session_id()
         async for output in self._process_request(
                 request_id,
+                session_id,
                 inputs,
                 sampling_params,
                 lora_request=lora_request,
@@ -852,6 +860,7 @@ class AsyncLLMEngine:
     async def _process_request(
         self,
         request_id: str,
+        session_id: int,
         inputs: PromptInputs,
         params: Union[SamplingParams, PoolingParams],
         *,
@@ -865,6 +874,7 @@ class AsyncLLMEngine:
 
         stream = await self.add_request(
             request_id,
+            session_id,
             inputs,
             params,
             arrival_time=arrival_time,

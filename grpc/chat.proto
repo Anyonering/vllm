@@ -3,11 +3,21 @@ package ChatVllm;
 
 service LlmEngine {
         rpc processChatReq(ChatReq) returns (ChatResp){}
+        rpc processInfoReq(InfoReq) returns (InfoResp){}
 }
 
 message ChatReq {
         string prompt = 1;
+        int32 session_id = 2;
         string request_id = 3;
+        bool is_last = 4;
+}
+
+message InfoReq {
+        int32 session_id = 1;
+}
+message InfoResp {
+        bool success = 1;
 }
 
 message ChatResp {

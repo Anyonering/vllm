@@ -38,13 +38,15 @@ class LlmEngine(chat_pb2_grpc.LlmEngineServicer):
         
     
     async def processChatReq(self, request: chat_pb2.ChatReq, context: grpc.aio.ServicerContext):
-        print(f"receive Request with request id {request.request_id} with prompt length {len(request.prompt)}")
+        print(f"receive Request with session id {request.session_id}, and request id {request.request_id} with prompt length {len(request.prompt)}")
+        self.engine.engine.scheduler[0].is_finish_dict[request.session_id] = request.is_last
         if(self.start_time == 0):
             self.start_time = time.time()
         results_generator = self.engine.generate(
         request.prompt,
         vllm.SamplingParams(temperature=0.8, top_p=0.95, max_tokens=2048, min_tokens=20,),
         request_id=request.request_id,
+        session_id = request.session_id,
         # refill_requests=refill_requests
         )
         final_output = None
@@ -58,6 +60,10 @@ class LlmEngine(chat_pb2_grpc.LlmEngineServicer):
         text_output = [output.text for output in final_output.outputs]
         return chat_pb2.ChatResp(answer=text_output[0])
     
+    async def processInfoReq(self, request: chat_pb2.InfoReq, context: grpc.aio.ServicerContext):
+        self.engine.engine.scheduler[0].refill_requests.append(request.session_id)
+        return chat_pb2.InfoResp(success=True)
+        
     
 async def serve() -> None:
     server = grpc.aio.server()

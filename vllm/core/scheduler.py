@@ -2,6 +2,7 @@ import enum
 import os
 import random
 import time
+import math
 from collections import deque
 from dataclasses import dataclass, field
 from typing import Deque, Dict, Iterable, List, Optional, Set, Tuple, Union
@@ -331,6 +332,11 @@ class Scheduler:
                                        else 0)
         self.num_cumulative_preemption: int = 0
         self.use_truncation = True
+        self.cumulative_session_id = -1
+        self.refill_wait: Deque[SequenceGroup] = deque()
+        self.finished : List[SequenceGroup] = list()
+        self.finished_session_id_list : List[int] = list()
+        self.is_finish_dict = {}
 
     @property
     def lora_enabled(self) -> bool:
@@ -342,8 +348,29 @@ class Scheduler:
         return 1
 
     def add_seq_group(self, seq_group: SequenceGroup) -> None:
-        # Add sequence groups to the waiting queue.
-        self.waiting.append(seq_group)
+        if(self.is_finish_dict[seq_group.session_id] == True):
+            seq_group.is_last_round = True
+        if(seq_group.session_id not in self.finished_session_id_list):
+            # Add sequence groups to the waiting queue.
+            if(seq_group.session_id > self.cumulative_session_id):
+                # the given session id is greater than cumulative session id
+                self.cumulative_session_id = seq_group.session_id
+            self.waiting.append(seq_group)
+        else:
+            # need to do refill wait
+            self.refill_wait.append(seq_group)
+            
+        
+    def get_new_session_id(self, request_num: Optional[int] = None):
+        if(request_num is None or request_num == 1):
+            self.cumulative_session_id += 1
+            print("new session id: ",self.cumulative_session_id)
+            return self.cumulative_session_id
+        else:
+            new_session_id_list = list(range(self.cumulative_session_id+1,self.cumulative_session_id+1+request_num))
+            self.cumulative_session_id +=request_num
+            print("new session ids list: ",new_session_id_list)
+            return new_session_id_list
 
     def abort_seq_group(self, request_id: Union[str, Iterable[str]]) -> None:
         """Aborts a sequence group with the given ID.
@@ -383,10 +410,10 @@ class Scheduler:
 
     def has_unfinished_seqs(self) -> bool:
         return len(self.waiting) != 0 or len(self.running) != 0 or len(
-            self.swapped) != 0
+            self.swapped) != 0 or len(self.refill_wait) != 0
 
     def get_num_unfinished_seq_groups(self) -> int:
-        return len(self.waiting) + len(self.running) + len(self.swapped)
+        return len(self.waiting) + len(self.running) + len(self.swapped) + len(self.refill_wait)
 
     def get_and_reset_finished_requests_ids(self) -> List[str]:
         """Flushes the list of request ids of previously finished seq_groups."""
@@ -986,6 +1013,113 @@ class Scheduler:
             seq_group=seq_group,
             num_lookahead_slots=self._get_num_lookahead_slots(is_prefill),
         )
+    
+    def refill_schedule(self)-> SchedulerOutputs:
+        refill_seq_groups: List[SequenceGroup] = []
+        budget = SchedulingBudget(
+            token_budget=self.scheduler_config.max_num_batched_tokens,
+            max_num_seqs=self.scheduler_config.max_num_seqs,
+        )
+        for seq_group in self.running:
+            budget.add_num_seqs(seq_group.request_id,
+                                seq_group.get_max_num_running_seqs())
+        unsuccess: List[SequenceGroup] = []
+        unsuccess_context: List[SequenceGroup] = []
+        ignored_seq_groups: List[SequenceGroup] = []
+        while len(self.refill_wait) > 0 and len(self.finished) > 0:
+            context_group = None
+            seq_group = self.refill_wait.popleft()
+            
+            for c_group in self.finished:
+                if(c_group.session_id == seq_group.session_id):
+                    context_group = c_group
+            if(context_group == None):
+                logger.warning("Context Sequence Group Not Found!")
+                unsuccess.append(seq_group)
+                
+                continue
+            else:
+                self.finished.remove(context_group)
+                sampling_params = seq_group.sampling_params
+                context_group.set_seq_group_status()
+                context_seq = context_group.get_seqs(SequenceStatus.WAITING)[0]
+                max_num_block = math.ceil(sampling_params.max_tokens/context_seq.block_size)
+                can_allocate = self.block_manager.append_slots_refill(context_seq,max_num_blocks=max_num_block)
+                if(can_allocate==AllocStatus.LATER):
+                    unsuccess_context.append(context_group)
+                    break
+                if(can_allocate==AllocStatus.NEVER):
+                    logger.warning(
+                    "Input prompt (%d tokens) is too long"
+                    " and exceeds the capacity of block_manager",
+                    num_new_tokens)
+                    context_seq.status = SequenceStatus.FINISHED_IGNORED
+                    ignored_seq_groups.append(context_group)
+                    unsuccess_context.append(context_group)
+                    continue
+                num_new_seqs = seq_group.get_max_num_running_seqs()
+                seq_group.set_seq_group_status()
+                assert len(seq_group.get_seqs(SequenceStatus.WAITING)) == 1 and len(context_group.get_seqs()) == 1 
+                
+                context_group.sampling_params = seq_group.sampling_params
+                # print("context_group.sampling_params.logprobs: ",context_group.sampling_params.logprobs)
+                
+                # print("original input len: ",len(context_seq.inputs['prompt_token_ids']))
+                context_seq.inputs['prompt_token_ids'].extend(context_seq.data._output_token_ids[:-1])
+                num_computed_tokens = len(context_seq.inputs['prompt_token_ids'])
+                new_seq = seq_group.get_seqs(SequenceStatus.WAITING)[0]
+                context_seq.inputs['prompt_token_ids'].extend(new_seq.data._prompt_token_ids[1:])
+                context_seq.status = SequenceStatus.RUNNING
+                context_seq.stop_reason = None
+                context_seq.output_text = ""
+                old_data  = context_seq.data
+                context_seq.data = SequenceData(context_seq.inputs["prompt_token_ids"])
+                context_seq.data.truncated_len = old_data.truncated_len
+                context_seq.data._num_computed_tokens = old_data._num_computed_tokens
+                num_new_tokens = context_seq.get_num_new_tokens()
+                context_seq.tokens.pop()
+                context_seq.tokens.extend(new_seq.inputs['prompt'])
+                context_seq.read_offset = context_seq.prefix_offset+1
+                context_group.request_id = seq_group.request_id
+                context_group.is_last_round = seq_group.is_last_round
+                context_group.metrics = seq_group.metrics
+                budget.add_num_batched_tokens(seq_group.request_id, num_new_tokens)
+                budget.add_num_seqs(seq_group.request_id, num_new_seqs)
+                
+                if(context_seq.data.get_len()>=sampling_params.max_tokens):
+                    # print("hitting here \nhitting here \nhitting here \n")
+                    cur_len = context_seq.data.get_len()
+                    num_blocks_truncated = math.ceil((cur_len - sampling_params.max_tokens)/context_seq.block_size)
+                    if(cur_len - sampling_params.max_tokens) % context_seq.block_size == 0:
+                        num_blocks_truncated +=1
+                    self.block_manager.truncate_blocks(seq=context_seq,num=num_blocks_truncated)
+                    num_tokens_truncated = num_blocks_truncated * context_seq.block_size
+                    context_seq.data.truncated_len += num_tokens_truncated
+                    context_seq.truncated = True
+                    context_seq.read_offset -= num_tokens_truncated
+                    context_seq.prefix_offset -= num_tokens_truncated
+                    context_seq.data._num_computed_tokens -= num_tokens_truncated
+                    
+                self.running.extend([context_group])
+                print(f"Currently adding seq group: {context_group.session_id} and request id {context_group.request_id}\n\n, and has seqs{context_group.get_seqs()[0]}")
+                refill_seq_groups.append(ScheduledSequenceGroup(seq_group=context_group,token_chunk_size=num_new_tokens))
+                
+        self.refill_wait.extend(unsuccess)
+        self.finished.extend(unsuccess_context)
+        if(len(refill_seq_groups)> 0):
+            self.prev_prompt_refill = True
+        return SchedulerOutputs(
+            scheduled_seq_groups=refill_seq_groups,
+            num_prefill_groups=len(refill_seq_groups),
+            num_batched_tokens=budget.num_batched_tokens,
+            blocks_to_swap_in=[],
+            blocks_to_swap_out=[],
+            blocks_to_copy=[],
+            ignored_seq_groups=ignored_seq_groups,
+            num_lookahead_slots=self._get_num_lookahead_slots(is_prefill=True),
+            running_queue_size=len(self.running),
+            preempted=0,
+        )
         
     def process_truncated_seqs(self)-> None:
         for seq_group in self.running:
@@ -1007,7 +1141,14 @@ class Scheduler:
         # such as self.running, self.swapped, and self.waiting.
         if(self.use_truncation):
             self.process_truncated_seqs()
-        scheduler_outputs = self._schedule()
+        scheduler_outputs = None
+        if(len(self.refill_wait)>0):
+            # handle refill first
+            scheduler_outputs = self.refill_schedule()
+            if(len(scheduler_outputs.scheduled_seq_groups)== 0):
+                scheduler_outputs = self._schedule()
+        else: 
+            scheduler_outputs = self._schedule()
         now = time.time()
 
         # Create input data structures.
@@ -1095,8 +1236,22 @@ class Scheduler:
                 seq_group.request_id for seq_group in queue
                 if seq_group.is_finished()
             ]
+        may_free = [seq_group for queue in [self.running, self.swapped, self.waiting] for seq_group in queue
+                             if (seq_group.is_finished())]
+        self.finished.extend([seq_group for seq_group in may_free
+                             if seq_group.is_finished() and (not seq_group.is_last_round)])
+        self.finished_session_id_list.extend([seq_group.session_id for seq_group in may_free
+                             if seq_group.is_finished() and (not seq_group.is_last_round)])
+        # remove duplicates
+        self.finished_session_id_list = list(set(self.finished_session_id_list))
+        need_to_free = [seq_group for seq_group in may_free
+                             if (seq_group.is_finished() and seq_group.is_last_round)]
         self.running = deque(seq_group for seq_group in self.running
                              if not seq_group.is_finished())
+        for instance_seq_group in need_to_free:
+            for seq in instance_seq_group.get_seqs():
+                print(f"Free seq {seq.seq_id} !\n")
+                self.block_manager.free(seq)
 
     def _allocate_and_set_running(self, seq_group: SequenceGroup) -> None:
         self.block_manager.allocate(seq_group)

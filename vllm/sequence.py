@@ -446,6 +446,7 @@ class SequenceGroup:
         encoder_seq: Optional[Sequence] = None,
         trace_headers: Optional[Dict[str, str]] = None,
         prompt_adapter_request: Optional[PromptAdapterRequest] = None,
+        session_id: Optional[int] = None,
     ) -> None:
         self.request_id = request_id
         self.seqs_dict = {seq.seq_id: seq for seq in seqs}
@@ -463,6 +464,8 @@ class SequenceGroup:
         self.prompt_adapter_request = prompt_adapter_request
         self.encoder_seq = encoder_seq
         self.trace_headers = trace_headers
+        self.session_id = session_id
+        self.is_last_round = False
 
     @property
     def prompt(self) -> Optional[str]:
@@ -529,6 +532,10 @@ class SequenceGroup:
     def set_finished_time(self, time: Optional[float]) -> None:
         """Sets the finished time for Request level timings."""
         self.metrics.finished_time = time
+        
+    def set_seq_group_status(self) -> None:
+        for seq in self.seqs_dict.values():
+            seq.status =  SequenceStatus.WAITING
 
     def get_max_num_running_seqs(self) -> int:
         """The maximum number of sequences running in parallel in the remaining

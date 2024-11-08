@@ -457,6 +457,7 @@ class GPUModelRunnerBase(ModelRunnerBase[TModelInputForGPU]):
                                     and len(computed_block_nums) > 0
                                     and self.sliding_window is None
                                     and is_prompt)
+                prefill_with_context = (is_prompt and (seq_len > context_len) and context_len > 0)
 
                 # These are seq_len/context_len capped to the sliding window.
                 # They are passed to decode kernel.
@@ -515,6 +516,8 @@ class GPUModelRunnerBase(ModelRunnerBase[TModelInputForGPU]):
                     else:
                         # Only happens when memory profiling runs.
                         block_table = []
+                elif (prefill_with_context and (seq_group_metadata.block_tables is not None)):
+                    block_table = seq_group_metadata.block_tables[seq_id]
                 else:
                     # Prefill without chunked prefill or memory profiling.
                     block_table = []

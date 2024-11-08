@@ -493,6 +493,7 @@ class LLMEngine:
     def _add_processed_request(
         self,
         request_id: str,
+        session_id: int,
         processed_inputs: LLMInputs,
         params: Union[SamplingParams, PoolingParams],
         arrival_time: float,
@@ -535,6 +536,7 @@ class LLMEngine:
             scheduler.get_num_unfinished_seq_groups()
             for scheduler in self.scheduler
         ]
+        seq_group.session_id = session_id
         min_cost_scheduler = self.scheduler[costs.index(min(costs))]
         min_cost_scheduler.add_seq_group(seq_group)
 
@@ -575,6 +577,7 @@ class LLMEngine:
     def add_request(
         self,
         request_id: str,
+        session_id: int,
         inputs: PromptInputs,
         params: Union[SamplingParams, PoolingParams],
         arrival_time: Optional[float] = None,
@@ -638,6 +641,7 @@ class LLMEngine:
 
         self._add_processed_request(
             request_id=request_id,
+            session_id=session_id,
             processed_inputs=processed_inputs,
             params=params,
             arrival_time=arrival_time,

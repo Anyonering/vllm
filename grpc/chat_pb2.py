@@ -24,7 +24,7 @@ _sym_db = _symbol_database.Default()
 
 
 
-DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\nchat.proto\x12\x08\x43hatVllm\"-\n\x07\x43hatReq\x12\x0e\n\x06prompt\x18\x01 \x01(\t\x12\x12\n\nrequest_id\x18\x03 \x01(\t\"\x1a\n\x08\x43hatResp\x12\x0e\n\x06\x61nswer\x18\x01 \x01(\t2F\n\tLlmEngine\x12\x39\n\x0eprocessChatReq\x12\x11.ChatVllm.ChatReq\x1a\x12.ChatVllm.ChatResp\"\x00\x62\x06proto3')
+DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\nchat.proto\x12\x08\x43hatVllm\"R\n\x07\x43hatReq\x12\x0e\n\x06prompt\x18\x01 \x01(\t\x12\x12\n\nsession_id\x18\x02 \x01(\x05\x12\x12\n\nrequest_id\x18\x03 \x01(\t\x12\x0f\n\x07is_last\x18\x04 \x01(\x08\"\x1d\n\x07InfoReq\x12\x12\n\nsession_id\x18\x01 \x01(\x05\"\x1b\n\x08InfoResp\x12\x0f\n\x07success\x18\x01 \x01(\x08\"\x1a\n\x08\x43hatResp\x12\x0e\n\x06\x61nswer\x18\x01 \x01(\t2\x81\x01\n\tLlmEngine\x12\x39\n\x0eprocessChatReq\x12\x11.ChatVllm.ChatReq\x1a\x12.ChatVllm.ChatResp\"\x00\x12\x39\n\x0eprocessInfoReq\x12\x11.ChatVllm.InfoReq\x1a\x12.ChatVllm.InfoResp\"\x00\x62\x06proto3')
 
 _globals = globals()
 _builder.BuildMessageAndEnumDescriptors(DESCRIPTOR, _globals)
@@ -32,9 +32,13 @@ _builder.BuildTopDescriptorsAndMessages(DESCRIPTOR, 'chat_pb2', _globals)
 if not _descriptor._USE_C_DESCRIPTORS:
   DESCRIPTOR._loaded_options = None
   _globals['_CHATREQ']._serialized_start=24
-  _globals['_CHATREQ']._serialized_end=69
-  _globals['_CHATRESP']._serialized_start=71
-  _globals['_CHATRESP']._serialized_end=97
-  _globals['_LLMENGINE']._serialized_start=99
-  _globals['_LLMENGINE']._serialized_end=169
+  _globals['_CHATREQ']._serialized_end=106
+  _globals['_INFOREQ']._serialized_start=108
+  _globals['_INFOREQ']._serialized_end=137
+  _globals['_INFORESP']._serialized_start=139
+  _globals['_INFORESP']._serialized_end=166
+  _globals['_CHATRESP']._serialized_start=168
+  _globals['_CHATRESP']._serialized_end=194
+  _globals['_LLMENGINE']._serialized_start=197
+  _globals['_LLMENGINE']._serialized_end=326
 # @@protoc_insertion_point(module_scope)
