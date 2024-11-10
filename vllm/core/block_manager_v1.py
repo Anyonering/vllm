@@ -475,12 +475,14 @@ class BlockSpaceManagerV1(BlockSpaceManager):
         self.block_tables[seq.seq_id] = block_table[num:]
         self.block_tables[seq.seq_id].extend(first_part)
         
-    def append_slots_refill(self,seq: Sequence, max_num_blocks:int,
+    def append_slots_refill(self,seq: Sequence, max_num_blocks:int, seq_need_blocks: int
     ) -> None:
         """Allocate physical slots for a sequence with new user prompt tokens."""
-        n_blocks = seq.n_blocks
+        n_blocks = seq_need_blocks
+        # print(f"seq id: {seq.seq_id}")
+        # print(f"block tables have {self.block_tables.keys()}")
         block_table = self.block_tables[seq.seq_id]
-        num_prompt_blocks = seq.n_blocks
+        # num_prompt_blocks = seq.n_blocks
         num_free_blocks = self.gpu_allocator.get_num_free_blocks()
         status = None
         # print("original block table: ",block_table)
@@ -492,7 +494,7 @@ class BlockSpaceManagerV1(BlockSpaceManager):
                 return AllocStatus.OK
         else:
             return AllocStatus.OK
-        if (self.num_total_gpu_blocks - num_prompt_blocks <
+        if (self.num_total_gpu_blocks - seq_need_blocks <
                 self.watermark_blocks):
             return AllocStatus.NEVER
         if num_free_blocks - num_blocks_diff >= self.watermark_blocks:

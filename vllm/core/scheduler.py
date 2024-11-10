@@ -336,6 +336,7 @@ class Scheduler:
         self.refill_wait: Deque[SequenceGroup] = deque()
         self.finished : List[SequenceGroup] = list()
         self.finished_session_id_list : List[int] = list()
+        self.wait_for_free : List[Sequence] = list()
         self.is_finish_dict = {}
 
     @property
@@ -406,6 +407,7 @@ class Scheduler:
                     if seq.is_finished():
                         continue
                     seq.status = SequenceStatus.FINISHED_ABORTED
+                    print(f"free seq with id {seq.seq_id} in scheduler line 409 ")
                     self.free_seq(seq)
 
     def has_unfinished_seqs(self) -> bool:
@@ -1041,10 +1043,14 @@ class Scheduler:
             else:
                 self.finished.remove(context_group)
                 sampling_params = seq_group.sampling_params
+                new_seq = seq_group.get_seqs(SequenceStatus.WAITING)[0]
+                print(f"new seq id: {new_seq.seq_id}")
                 context_group.set_seq_group_status()
                 context_seq = context_group.get_seqs(SequenceStatus.WAITING)[0]
                 max_num_block = math.ceil(sampling_params.max_tokens/context_seq.block_size)
-                can_allocate = self.block_manager.append_slots_refill(context_seq,max_num_blocks=max_num_block)
+                total_token_len = len(new_seq.data._prompt_token_ids[1:]) + context_seq.get_len() - 1
+                seq_need_block = math.ceil( total_token_len/context_seq.block_size)
+                can_allocate = self.block_manager.append_slots_refill(context_seq,max_num_block,seq_need_block)
                 if(can_allocate==AllocStatus.LATER):
                     unsuccess_context.append(context_group)
                     break
@@ -1069,6 +1075,8 @@ class Scheduler:
                 num_computed_tokens = len(context_seq.inputs['prompt_token_ids'])
                 new_seq = seq_group.get_seqs(SequenceStatus.WAITING)[0]
                 context_seq.inputs['prompt_token_ids'].extend(new_seq.data._prompt_token_ids[1:])
+                print(f"context seq id: {context_seq.seq_id}")
+                
                 context_seq.status = SequenceStatus.RUNNING
                 context_seq.stop_reason = None
                 context_seq.output_text = ""
@@ -1228,7 +1236,9 @@ class Scheduler:
 
     def free_seq(self, seq: Sequence) -> None:
         """Free a sequence from a block table."""
-        self.block_manager.free(seq)
+        print("free through scheduler free seq")
+        self.wait_for_free.append(seq)
+        # self.block_manager.free(seq)
 
     def free_finished_seq_groups(self) -> None:
         for queue in [self.running, self.swapped, self.waiting]:
@@ -1244,6 +1254,10 @@ class Scheduler:
                              if seq_group.is_finished() and (not seq_group.is_last_round)])
         # remove duplicates
         self.finished_session_id_list = list(set(self.finished_session_id_list))
+        temp_finished_seq_id = [seq_id for seq_group in self.finished for seq_id in seq_group.seqs_dict.keys() ]
+        self.wait_for_free = [seq for seq in self.wait_for_free if seq.seq_id not in temp_finished_seq_id]
+        for seq in self.wait_for_free:
+            self.block_manager.free(seq)
         need_to_free = [seq_group for seq_group in may_free
                              if (seq_group.is_finished() and seq_group.is_last_round)]
         self.running = deque(seq_group for seq_group in self.running
@@ -1252,6 +1266,7 @@ class Scheduler:
             for seq in instance_seq_group.get_seqs():
                 print(f"Free seq {seq.seq_id} !\n")
                 self.block_manager.free(seq)
+        self.wait_for_free = []
 
     def _allocate_and_set_running(self, seq_group: SequenceGroup) -> None:
         self.block_manager.allocate(seq_group)

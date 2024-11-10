@@ -42,7 +42,7 @@ class ChatDataLoader(object):
         #     )
         # )
         # simplify for checking correctness and debugging
-        self.num_current_clients = 1
+        self.num_current_clients = 15
         # numbers of word read
         print(f"Num current clients {self.num_current_clients}")
         self.crps = abs(
@@ -173,7 +173,7 @@ class ChatDataLoader(object):
             # if(not is_last)
             #     req_data = next_send
             # TODO Need to be changed to match the actually returned token num
-            interval_info_req = 1
+            interval_info_req = 3
             # try:
                 
             #     next_recv = self.active_sessions[client_id].pop(0)
