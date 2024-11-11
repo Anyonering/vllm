@@ -597,7 +597,7 @@ class BlockSpaceManagerV1(BlockSpaceManager):
     def truncate_first_append_last(self, seq: Sequence):
         block_table = self.block_tables[seq.seq_id]
         first_block = block_table.pop(0)
-        block_table.append(first_block)
+        self.block_tables[seq.seq_id].append(first_block)
 
     def _free_block_table(self, block_table: BlockTable) -> None:
         # when using a sliding window, each seq will only use up

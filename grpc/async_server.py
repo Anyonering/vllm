@@ -30,7 +30,9 @@ class LlmEngine(chat_pb2_grpc.LlmEngineServicer):
             model=model_dir,
             enforce_eager=True,
             trust_remote_code=True,
-            max_model_len=2048,))
+            max_model_len=2048,
+            gpu_memory_utilization=0.8
+            ))
         self.output_len = []
         self.ttft_list = []
         self.run_time = []

@@ -43,7 +43,7 @@ class ChatDataLoader(object):
         #     )
         # )
         # simplify for checking correctness and debugging
-        self.num_current_clients = 20
+        self.num_current_clients = 30
         # numbers of word read
         print(f"Num current clients {self.num_current_clients}")
         self.crps = abs(
@@ -83,7 +83,7 @@ class ChatDataLoader(object):
         self.interval_between_sessions = 3
         return None
 
-    async def rpc_call(self, req_data, client_id, is_last):
+    async def rpc_call(self, req_data, client_id, is_last, token_len):
         """
         RPC calls for sending requests to the server
         """
@@ -96,7 +96,7 @@ class ChatDataLoader(object):
             with self.counter_lock:
                 self.request_id_counter += 1
                 new_req_id = str(self.request_id_counter)
-            print(f"Ready to send request with id {new_req_id}, with input length {len(input)} and content: {input[:100]}!")
+            print(f"Ready to send request with id {new_req_id}, with input length {token_len} and content: {input[:100]}!")
             
             request = chat_pb2.ChatReq(
                 prompt=input, request_id=new_req_id
@@ -176,9 +176,12 @@ class ChatDataLoader(object):
                 next_send = input_data.pop(0)
                 assert next_send["from"] == "human"
                 interval_chat_req = len(next_send["value"])/self.mean_type_rate
+            len_token = 0
             with self.tokenizer_lock:
-                text_send = self.tokenizer.decode(self.tokenizer.encode(total_text)[-(self.max_prompt_len-16):])
-            coro = self.rpc_call(text_send, cur_client_id, is_last=is_last)
+                len_token = len(self.tokenizer.encode(total_text)[-(self.max_prompt_len-8):])
+                print(f"")
+                text_send = self.tokenizer.decode(self.tokenizer.encode(total_text)[-(self.max_prompt_len-8):])
+            coro = self.rpc_call(text_send, cur_client_id, is_last=is_last,token_len=len_token)
             future = asyncio.run_coroutine_threadsafe(coro, loop)
             answer_len, answer_text = future.result()
             total_text += answer_text
