@@ -129,6 +129,7 @@ class SequenceData:
         self._num_computed_tokens = 0
         self._stage: SequenceStage = SequenceStage.PREFILL
         self.truncated_len = 0
+        self.been_preempted = False
 
         self._update_cached_all_tokens()
 
@@ -173,6 +174,9 @@ class SequenceData:
         return len(self._output_token_ids)
 
     def get_token_ids(self) -> List[int]:
+        return self._cached_all_token_ids[self.truncated_len:]
+    
+    def get_full_token_ids(self)-> List[int]:
         return self._cached_all_token_ids
 
     def get_prefix_token_ids(

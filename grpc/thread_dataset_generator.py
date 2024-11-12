@@ -42,7 +42,7 @@ class ChatDataLoader(object):
         #     )
         # )
         # simplify for checking correctness and debugging
-        self.num_current_clients = 15
+        self.num_current_clients = 30
         # numbers of word read
         print(f"Num current clients {self.num_current_clients}")
         self.crps = abs(

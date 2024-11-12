@@ -189,3 +189,4 @@ hip_compat.h
 *.json
 grpc/chat_pb2.pyi
 grpc/test_tokenizer.ipynb
+grpc/output.txt

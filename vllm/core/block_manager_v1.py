@@ -470,10 +470,14 @@ class BlockSpaceManagerV1(BlockSpaceManager):
         
     def truncate_blocks(self, seq: Sequence, num:int):
         block_table = self.block_tables[seq.seq_id]
+        original_len = len(block_table)
         assert num < len(block_table)
         first_part = block_table[:num]
         self.block_tables[seq.seq_id] = block_table[num:]
         self.block_tables[seq.seq_id].extend(first_part)
+        new_len = len(self.block_tables[seq.seq_id])
+        assert original_len == new_len
+        assert original_len == 128, "The block table size is not 128 but is truncated! Illegal!"
         
     def append_slots_refill(self,seq: Sequence, max_num_blocks:int, seq_need_blocks: int
     ) -> None:

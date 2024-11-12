@@ -617,6 +617,16 @@ class GPUModelRunnerBase(ModelRunnerBase[TModelInputForGPU]):
                     if i < start_idx:
                         slot_mapping.append(_PAD_SLOT_ID)
                         continue
+                    if(i//self.block_size >= len(block_table)):
+                        print("i: ",i)
+                        print("context length: ",context_len)
+                        print("sequence length: ",seq_len)
+                        print("block table len: ",len(block_table))
+                        print("sequence real length: ", seq_data.get_real_len())
+                        print("sequence length: ", seq_data.get_len())
+                        print(f"sequence group request id : {seq_group_metadata.request_id}")
+                        print(f"sequence group seq id : {seq_id}")
+                        print(f"seq has been preempted:{seq_data.been_preempted}")
 
                     block_number = block_table[i // self.block_size]
                     block_offset = i % self.block_size

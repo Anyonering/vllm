@@ -338,6 +338,7 @@ class Scheduler:
         self.finished_session_id_list : List[int] = list()
         self.wait_for_free : List[Sequence] = list()
         self.is_finish_dict = {}
+        self.max_model_len = 2048
 
     @property
     def lora_enabled(self) -> bool:
@@ -477,8 +478,8 @@ class Scheduler:
 
             running_queue.popleft()
             first_seq = seq_group.get_seqs(SequenceStatus.RUNNING)[0]
-            if(first_seq.truncated):
-                # need to handle truncated sequence differently
+            block_len_smaller = len(self.block_manager.block_tables[first_seq.seq_id]) < self.max_model_len/first_seq.block_size
+            if(first_seq.truncated and not block_len_smaller):
                 is_prefill = seq_group.is_prefill()
                 if is_prefill:
                     prefill_seq_groups.append(
@@ -492,6 +493,30 @@ class Scheduler:
                 budget.add_num_batched_tokens(seq_group.request_id,
                                               num_running_tokens)
                 continue
+            # if(first_seq.truncated and (not first_seq.data.been_preempted)):
+                
+            #     is_prefill = seq_group.is_prefill()
+            #     if is_prefill:
+            #         prefill_seq_groups.append(
+            #             ScheduledSequenceGroup(
+            #                 seq_group=seq_group,
+            #                 token_chunk_size=num_running_tokens))
+            #     else:
+            #         decode_seq_groups.append(
+            #             ScheduledSequenceGroup(seq_group=seq_group,
+            #                                    token_chunk_size=1))
+            #     budget.add_num_batched_tokens(seq_group.request_id,
+            #                                   num_running_tokens)
+            #     continue
+            else:
+                if(first_seq.truncated and first_seq.data.been_preempted):
+                    # need to check if it needs to append slots
+                    if len(self.block_manager.block_tables[first_seq.seq_id])<= self.max_model_len/first_seq.block_size :
+                        assert len(self.block_manager.block_tables[first_seq.seq_id]) == (self.max_model_len/first_seq.block_size) -1
+                        assert first_seq.data.get_num_computed_tokens() == self.max_model_len - first_seq.block_size
+                        
+                    pass
+                # need to handle truncated sequence differently
             while not self._can_append_slots(seq_group):
                 budget.subtract_num_batched_tokens(seq_group.request_id,
                                                    num_running_tokens)
@@ -732,6 +757,16 @@ class Scheduler:
             assert len(waiting_seqs) == 1, (
                 "Waiting sequence group should have only one prompt "
                 "sequence.")
+            # is_preempt_and_truncated = False
+            # if(waiting_seqs[0].data.been_preempted and waiting_seqs[0].data.get_real_len()> self.max_model_len):
+            #     print(f"Getting here in schedule prefill")
+            #     is_preempt_and_truncated = True
+            #     # the sequence need to have max_model_len/blocksize number of blocks 
+            #     # since it has been truncated
+            #     # print()
+            #     if(waiting_seqs[0].data.truncated_len >= 16):
+            #         waiting_seqs[0].data.truncated_len -= 1
+                
             num_new_tokens = self._get_num_new_tokens(seq_group,
                                                       SequenceStatus.WAITING,
                                                       enable_chunking, budget)
@@ -764,7 +799,7 @@ class Scheduler:
                 ignored_seq_groups.append(seq_group)
                 waiting_queue.popleft()
                 continue
-
+            
             lora_int_id = 0
             if self.lora_enabled:
                 lora_int_id = seq_group.lora_int_id
@@ -1048,11 +1083,12 @@ class Scheduler:
                 context_group.set_seq_group_status()
                 context_seq = context_group.get_seqs(SequenceStatus.WAITING)[0]
                 max_num_block = math.ceil(sampling_params.max_tokens/context_seq.block_size)
-                total_token_len = len(new_seq.data._prompt_token_ids[1:]) + context_seq.get_len() - 1
+                total_token_len = len(new_seq.data._prompt_token_ids[1:]) + context_seq.get_len()
                 seq_need_block = math.ceil( total_token_len/context_seq.block_size)
                 can_allocate = self.block_manager.append_slots_refill(context_seq,max_num_block,seq_need_block)
                 if(can_allocate==AllocStatus.LATER):
                     unsuccess_context.append(context_group)
+                    unsuccess.append(seq_group)
                     break
                 if(can_allocate==AllocStatus.NEVER):
                     logger.warning(
@@ -1110,6 +1146,7 @@ class Scheduler:
                     
                 self.running.extend([context_group])
                 print(f"Currently adding seq group: {context_group.session_id} and request id {context_group.request_id}\n\n, and has seqs{context_group.get_seqs()[0]}")
+                print(f"context seq block table len: {len(self.block_manager.block_tables[context_seq.seq_id])}")
                 refill_seq_groups.append(ScheduledSequenceGroup(seq_group=context_group,token_chunk_size=num_new_tokens))
                 
         self.refill_wait.extend(unsuccess)
@@ -1136,6 +1173,9 @@ class Scheduler:
                 continue
             else:
                 for truncated_seq in truncated_seqs:
+                    assert len(self.block_manager.block_tables[truncated_seq.seq_id]) == 128, \
+                            f"the actual truncated seq with id {truncated_seq.seq_id}"+\
+                            f"has block size = {len(self.block_manager.block_tables[truncated_seq.seq_id])}"
                     self.block_manager.truncate_first_append_last(truncated_seq)
                     truncated_seq.status = SequenceStatus.RUNNING
                     truncated_seq.truncated = True
@@ -1349,6 +1389,7 @@ class Scheduler:
         assert len(seqs) == 1
         for seq in seqs:
             seq.status = SequenceStatus.WAITING
+            seq.data.been_preempted = True
             self.free_seq(seq)
             seq.reset_state_for_recompute()
 
@@ -1357,6 +1398,9 @@ class Scheduler:
         seq_group: SequenceGroup,
         blocks_to_swap_out: List[Tuple[int, int]],
     ) -> None:
+        seqs = seq_group.get_seqs()
+        for seq in seqs:
+            seq.data.been_preempted = True
         self._swap_out(seq_group, blocks_to_swap_out)
 
     def _swap_in(
