@@ -18,6 +18,9 @@
 # limitations under the License.
 """Inference-only OPT model compatible with HuggingFace weights."""
 from typing import Iterable, List, Optional, Tuple
+import sys
+import os
+import pdb
 
 import torch
 from torch import nn
@@ -244,7 +247,29 @@ class OPTDecoder(nn.Module):
         kv_caches: List[torch.Tensor],
         attn_metadata: AttentionMetadata,
     ) -> torch.Tensor:
-        inputs_embeds = self.embed_tokens(input_ids)
+        inputs_embeds = None
+        try:
+            inputs_embeds = self.embed_tokens(input_ids)
+        except RuntimeError as e:
+            cuda_visible_device = os.environ["CUDA_VISIBLE_DEVICES"]
+            # print(f"torch.cuda.device_count: {torch.cuda.device_count()}")
+            # print(f"os.environ[CUDA_VISIBLE_DEVICES]: {cuda_visible_device}")
+            pdb.set_trace()
+            torch.set_printoptions(threshold=10000)
+            print(f"self.embed_tokens.weight : {self.embed_tokens.weight}")
+            # print(f"positions: {positions}")
+            # print(f"attn_metadata: {attn_metadata}")
+            try_another = torch.embedding(self.embed_tokens.weight, input_ids.long(), -1, False, False)
+            print(f"test another result: {try_another}")
+            print(f"input tokens length: {len(input_ids)}\n\n")
+            # print(f"input tokens: {input_ids}\n\n")
+            print("Caught CUDA error:", e)
+            cpu_embed = self.embed_tokens.to('cpu')
+            cpu_input_ids = input_ids.to('cpu')
+            result_embed = cpu_embed(cpu_input_ids)
+            print(f"this is cpu result embed: {result_embed}")
+            sys.exit(1)
+            
         pos_embeds = self.embed_positions(positions)
         if self.project_in is not None:
             inputs_embeds, _ = self.project_in(inputs_embeds)

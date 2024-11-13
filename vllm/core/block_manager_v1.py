@@ -468,12 +468,14 @@ class BlockSpaceManagerV1(BlockSpaceManager):
             self.gpu_allocator.free(last_block)
             return [(last_block.block_number, new_block.block_number)]
         
-    def append_slots_refill(self,seq: Sequence, max_num_blocks:int,
+    def append_slots_refill(self,seq: Sequence, max_num_blocks:int, seq_need_blocks: int
     ) -> None:
         """Allocate physical slots for a sequence with new user prompt tokens."""
-        n_blocks = seq.n_blocks
+        n_blocks = seq_need_blocks
+        # print(f"seq id: {seq.seq_id}")
+        # print(f"block tables have {self.block_tables.keys()}")
         block_table = self.block_tables[seq.seq_id]
-        num_prompt_blocks = seq.n_blocks
+        # num_prompt_blocks = seq.n_blocks
         num_free_blocks = self.gpu_allocator.get_num_free_blocks()
         status = None
         # print("original block table: ",block_table)
@@ -485,16 +487,16 @@ class BlockSpaceManagerV1(BlockSpaceManager):
                 return AllocStatus.OK
         else:
             return AllocStatus.OK
-        if (self.num_total_gpu_blocks - num_prompt_blocks <
+        if (self.num_total_gpu_blocks - seq_need_blocks <
                 self.watermark_blocks):
             return AllocStatus.NEVER
         if num_free_blocks - num_blocks_diff >= self.watermark_blocks:
             status = AllocStatus.OK
         else:
             return AllocStatus.LATER
-        
+
         # Allocate new physical token blocks that will store the prompt tokens.
-        
+
         # block_table: BlockTable = []
         for logical_idx in range(num_blocks_diff):
             block = self.gpu_allocator.allocate()
@@ -550,6 +552,28 @@ class BlockSpaceManagerV1(BlockSpaceManager):
         # at least one free block right after the swap-in.
         # NOTE: This should match the logic in can_append_slot().
         num_required_blocks = len(blocks) + num_swapped_seqs
+        if self.gpu_allocator.get_num_total_blocks() < num_required_blocks:
+            return AllocStatus.NEVER
+        elif num_free_blocks - num_required_blocks >= self.watermark_blocks:
+            return AllocStatus.OK
+        else:
+            return AllocStatus.LATER
+        
+    def can_swap_finished(self, seq_group: SequenceGroup) -> AllocStatus:
+        seq_to_swap = seq_group.get_seqs()[0]
+        assert seq_to_swap is not None
+        block_size = seq_to_swap.block_size
+        blocks_num = seq_to_swap.get_len()/block_size
+        num_swapped_seqs = seq_group.num_seqs(status=SequenceStatus.SWAPPED)
+        if seq_group.is_encoder_decoder():
+            num_swapped_seqs += 1
+        if(seq_to_swap.get_len()%block_size != 0 and num_swapped_seqs ==0):
+            blocks_num += 1
+        num_free_blocks = self.gpu_allocator.get_num_free_blocks()
+        # NOTE: Conservatively, we assume that every sequence will allocate
+        # at least one free block right after the swap-in.
+        # NOTE: This should match the logic in can_append_slot().
+        num_required_blocks = blocks_num + num_swapped_seqs
         if self.gpu_allocator.get_num_total_blocks() < num_required_blocks:
             return AllocStatus.NEVER
         elif num_free_blocks - num_required_blocks >= self.watermark_blocks:

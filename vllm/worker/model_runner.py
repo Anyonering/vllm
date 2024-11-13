@@ -617,7 +617,7 @@ class GPUModelRunnerBase(ModelRunnerBase[TModelInputForGPU]):
                     if i < start_idx:
                         slot_mapping.append(_PAD_SLOT_ID)
                         continue
-                    if(i // self.block_size) >= len(block_table):
+                    if(i // self.block_size) >= len(block_table) or (len(block_table) > 128):
                         print("i: ",i)
                         print("context length: ",context_len)
                         print("sequence length: ",seq_len)

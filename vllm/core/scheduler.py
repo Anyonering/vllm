@@ -392,6 +392,7 @@ class Scheduler:
                                        if self.enable_artificial_preemption
                                        else 0)
         self.num_cumulative_preemption: int = 0
+        self.max_model_len = 2048
         self.cumulative_session_id = -1
         self.use_truncation = True
         self.threshold_refill = 0
@@ -563,7 +564,9 @@ class Scheduler:
 
             running_queue.popleft()
             first_seq = seq_group.get_seqs(SequenceStatus.RUNNING)[0]
-            if(first_seq.truncated):
+            block_len_smaller = len(self.block_manager.block_tables[first_seq.seq_id]) < self.max_model_len/first_seq.block_size
+            if(first_seq.truncated and not block_len_smaller):
+                # if(first_seq.truncated):
                 # need to handle truncated sequence differently
                 is_prefill = seq_group.is_prefill()
                 if is_prefill:
@@ -1147,6 +1150,9 @@ class Scheduler:
         for seq_group in self.running:
             budget.add_num_seqs(seq_group.request_id,
                                 seq_group.get_max_num_running_seqs())
+        unsuccess: List[SequenceGroup] = []
+        unsuccess_context: List[SequenceGroup] = []
+        unsuccess_req_id: List[str] = []
         while len(self.refill_wait) > 0 and len(self.context_req_id_ref) > 0:
             context_req_id = self.context_req_id_ref.pop(0)
             context_group = None
@@ -1159,16 +1165,42 @@ class Scheduler:
             num_new_seqs = seq_group.get_max_num_running_seqs()
             temp_sync_stream = []
             sampling_params = seq_group.sampling_params
+            
             for refilled_group in self.refilled:
                 if(refilled_group.request_id == context_req_id):
                     context_group = refilled_group
                     break
             if(context_group == None):
                 logger.warning("Context Sequence Group Not Found!")
+                unsuccess.append(seq_group)
+                unsuccess_req_id.append(context_req_id)
+                continue
             else:
                 # print(len(seq_group.get_seqs(SequenceStatus.WAITING)))
                 # print(len(context_group.get_seqs()))
+                self.refilled.remove(context_group)
                 assert len(seq_group.get_seqs(SequenceStatus.WAITING)) == 1 and len(context_group.get_seqs()) == 1 
+                new_seq = seq_group.get_seqs(SequenceStatus.WAITING)[0]
+                context_seq = context_group.get_seqs()[0]
+                max_num_block = math.ceil(sampling_params.max_tokens/context_seq.block_size)
+                total_token_len = len(new_seq.data._prompt_token_ids[1:]) + context_seq.get_len()
+                seq_need_block = math.ceil( total_token_len/context_seq.block_size)
+                can_allocate = self.block_manager.append_slots_refill(context_seq,max_num_block,seq_need_block)
+                if(can_allocate==AllocStatus.LATER):
+                    unsuccess_context.append(context_group)
+                    unsuccess.append(seq_group)
+                    unsuccess_req_id.append(context_req_id)
+                    break
+                if(can_allocate==AllocStatus.NEVER):
+                    logger.warning(
+                    "Input prompt (%d tokens) is too long"
+                    " and exceeds the capacity of block_manager",
+                    num_new_tokens)
+                    context_seq.status = SequenceStatus.FINISHED_IGNORED
+                    ignored_seq_groups.append(context_group)
+                    unsuccess_context.append(context_group)
+                    continue
+                # otherwise we can allocate the new sequence with context
                 # need to update the new sequence group to include its context
                 context_group.set_seq_group_status()
                 context_group.sampling_params = seq_group.sampling_params
@@ -1214,20 +1246,20 @@ class Scheduler:
                 print("num_new_tokens: ",num_new_tokens)
                 budget.add_num_batched_tokens(seq_group.request_id, num_new_tokens)
                 budget.add_num_seqs(seq_group.request_id, num_new_seqs)
-                max_num_block = math.ceil(sampling_params.max_tokens/context_seq.block_size)
-                # TODO
-                # need to check if it can be allocated later
-                can_allocate = self.block_manager.append_slots_refill(context_seq,max_num_blocks=max_num_block)
-                if(can_allocate==AllocStatus.LATER):
-                    break
-                if(can_allocate==AllocStatus.NEVER):
-                    logger.warning(
-                    "Input prompt (%d tokens) is too long"
-                    " and exceeds the capacity of block_manager",
-                    num_new_tokens)
-                    context_seq.status = SequenceStatus.FINISHED_IGNORED
-                    ignored_seq_groups.append(context_group)
-                    continue
+                # max_num_block = math.ceil(sampling_params.max_tokens/context_seq.block_size)
+                # # TODO
+                # # need to check if it can be allocated later
+                # can_allocate = self.block_manager.append_slots_refill(context_seq,max_num_blocks=max_num_block)
+                # if(can_allocate==AllocStatus.LATER):
+                #     break
+                # if(can_allocate==AllocStatus.NEVER):
+                #     logger.warning(
+                #     "Input prompt (%d tokens) is too long"
+                #     " and exceeds the capacity of block_manager",
+                #     num_new_tokens)
+                #     context_seq.status = SequenceStatus.FINISHED_IGNORED
+                #     ignored_seq_groups.append(context_group)
+                #     continue
                 
                 self.refill_info_dict[context_group.session_id].block_state = ON_DEVICE
                 
@@ -1261,6 +1293,9 @@ class Scheduler:
                         
         self.stream_in_use = [stream_info for stream_info in self.stream_in_use if stream_info not in temp_sync_stream]
         temp_sync_stream = [stream_info[0] for stream_info in temp_sync_stream]
+        self.refilled.extend(unsuccess_context)
+        self.refill_wait.extend(unsuccess)
+        self.context_req_id_ref.extend(unsuccess_req_id)
         print("temp_sync_stream: ",temp_sync_stream)
         print("length of scheduled refilled seq_group: ",len(refill_seq_groups))
         # print("-----------------\n------------\n\n-----------\n\n---------")
@@ -1303,6 +1338,8 @@ class Scheduler:
         # Schedule sequence groups.
         # This function call changes the internal states of the scheduler
         # such as self.running, self.swapped, and self.waiting.
+        # cuda_visible_device = os.environ["CUDA_VISIBLE_DEVICES"]
+        # assert cuda_visible_device == "0"
         schedule_begin = time.time()
         # need to handle truncated sequences first
         if(self.use_truncation):
@@ -1454,13 +1491,17 @@ class Scheduler:
                         temp_seq_group = seq_group
                         break
                 if(find_one and (temp_seq_group is not None)):
-                    if(self.block_manager.can_swap_in(temp_seq_group)):
-                        mapping = self.block_manager.swap_in_refill(seq_group)
+                    aloc_status = self.block_manager.can_swap_finished(temp_seq_group)
+                    if(aloc_status==AllocStatus.OK):
+                        print("getting OK in allocate refill blocks\n\n")
+                        print(f"number of free blocks in gpu: {len(self.block_manager.gpu_allocator.free_blocks)}")
+                        print(f"seq group requires #{math.ceil((temp_seq_group.get_seqs()[0].get_len())/16) } blocks!")
+                        mapping = self.block_manager.swap_in_refill(temp_seq_group)
                         stream_id = None
                         has_finished_kick = True
                         index_to_pop = None
                         for stream_info in self.stream_in_use:
-                            if(stream_info[1]==seq_group.session_id and stream_info[2]==KICKING):
+                            if(stream_info[1]==temp_seq_group.session_id and stream_info[2]==KICKING):
                                 stream_id = stream_info[0]
                                 has_finished_kick = False
                                 index_to_pop = self.stream_in_use.index(stream_info)
@@ -1473,16 +1514,18 @@ class Scheduler:
                         else:
                             self.stream_in_use.pop(index_to_pop)
                             
-                        self.stream_in_use.append((stream_id,seq_group.session_id,REFILLING))
+                        self.stream_in_use.append((stream_id,temp_seq_group.session_id,REFILLING))
                         scheduler_outputs.refill_index.extend([len(mapping)])
                         scheduler_outputs.blocks_to_refill.extend(mapping)
                         scheduler_outputs.refill_stream.extend([stream_id])
-                        self.refilled.append(seq_group)
+                        self.refilled.append(temp_seq_group)
                         self.finished_swapped.remove(temp_seq_group)
-                        num_blocks_seq = seq_group.get_seqs()[0].n_blocks
-                        self.refill_info_dict[seq_group.session_id] = SeqGroupBlockInfo(seq_group,num_blocks_seq, stream_id, REFILLING)
+                        num_blocks_seq = temp_seq_group.get_seqs()[0].n_blocks
+                        self.refill_info_dict[temp_seq_group.session_id] = SeqGroupBlockInfo(temp_seq_group,num_blocks_seq, stream_id, REFILLING)
                     else:
                         print("Running out of gpu blocks for refill requests!")
+                        self.refill_requests.append(temp_session_id)
+                        break
                 else:
                     print("Invalid request id!")
                     print(f"session id {temp_session_id} is not found in finished_swapped seq group !")
@@ -1615,7 +1658,7 @@ class Scheduler:
         else:
             preemption_mode = PreemptionMode.RECOMPUTE
 
-        if self.num_cumulative_preemption % 50 == 0:
+        if self.num_cumulative_preemption % 5 == 0:
             logger.warning(
                 "Sequence group %s is preempted by %s mode because there is "
                 "not enough KV cache space. This can affect the end-to-end "
@@ -1623,6 +1666,7 @@ class Scheduler:
                 "tensor_parallel_size to provide more KV cache memory. "
                 "total_num_cumulative_preemption=%d", seq_group.request_id,
                 preemption_mode, self.num_cumulative_preemption + 1)
+            logger.warning(f"seq_group has len: {seq_group.get_seqs()[0].get_len()}")
         self.num_cumulative_preemption += 1
 
         if preemption_mode == PreemptionMode.RECOMPUTE:

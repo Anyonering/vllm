@@ -86,7 +86,7 @@ class StopChecker:
             return
 
         if(self.use_truncation):
-            if(seq.data.get_real_len() >= sampling_params.max_tokens and seq.get_len()%seq.block_size == 0 and 
+            if(seq.data.get_real_len() >= sampling_params.max_tokens and seq.get_len() == sampling_params.max_tokens and 
                seq.data.get_output_len() < sampling_params.max_tokens):
                 # assuming max tokens is the multiple of block_size
                 # need to allocate the first block in the sequence as the 
