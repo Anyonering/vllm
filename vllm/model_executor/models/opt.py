@@ -21,6 +21,7 @@ from typing import Iterable, List, Optional, Tuple
 import sys
 import os
 import pdb
+import json
 
 import torch
 from torch import nn
@@ -251,6 +252,8 @@ class OPTDecoder(nn.Module):
         try:
             inputs_embeds = self.embed_tokens(input_ids)
         except RuntimeError as e:
+            with open("log_err.txt",'w') as fopen:
+                json.dump(input_ids.tolist(),fopen)
             cuda_visible_device = os.environ["CUDA_VISIBLE_DEVICES"]
             # print(f"torch.cuda.device_count: {torch.cuda.device_count()}")
             # print(f"os.environ[CUDA_VISIBLE_DEVICES]: {cuda_visible_device}")
