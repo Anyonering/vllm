@@ -62,6 +62,28 @@ class SessionStatus:
         self.num_blocks = 0
         self.last_stream_use = -1
         self.is_last_round = False
+        
+@dataclass   
+class SwapStatus(enum.Enum):
+    SWAP_IN = enum.auto()
+    SWAP_OUT = enum.auto()
+    SYNCHRONIZED = enum.auto()
+
+@dataclass   
+class KvCacheSwapMeta:   
+    swap_status: SwapStatus
+    mapping:  List[Tuple[int, int]]
+    stream_position: List[int]
+    stream_list: List[int]
+    sync_this_time: bool
+    
+    def __init__(self,swap_status:SwapStatus):
+        self.swap_status = swap_status
+        self.mapping = []
+        self.stream_list = []
+        self.stream_position = []
+        self.sync_this_time = False
+
     
 
 class PreemptionMode(enum.Enum):
@@ -386,6 +408,9 @@ class Scheduler:
         # sequence group that do not have their context history in DRAM but chat req has arrived
         # need to allocate both context and new seq tokens
         self.wait_refill: Deque[SequenceGroup] = deque()
+        # a deque to handle kv cache swapping
+        self.kv_swap_meta: Deque[KvCacheSwapMeta] = deque()
+        self.current_swap_status: SwapStatus = SwapStatus.SYNCHRONIZED
         # Sequence groups temporarily finished.
         # Contain decode requests that are temporarily holding after finished.
         self.temp_finished: List[int] = list()
@@ -402,8 +427,8 @@ class Scheduler:
         self._finished_requests_ids: List[str] = list()
         # cuda stream that are availabe to use
         self.stream_avail = [i for i in range(0,cache_config.num_stream)]
-        # stream to sync in current schedule time
-        self.current_sync: Deque[int] = deque()
+        # cuda streams that are currently being used in workers
+        self.stream_in_use = []
         # Time at previous scheduling step
         self.prev_time = 0.0
         # Did we schedule a prompt at previous step?
@@ -533,14 +558,34 @@ class Scheduler:
     def sync_to_host(self, session_id) -> None:
         # for sess_id in self.refill_requests:
         this_session_info = self.session_dict[session_id]
+        assert this_session_info.block_status >=BlockStatus.KICKING_OUT
         if(this_session_info.block_status == BlockStatus.KICKING_OUT):
             assert this_session_info.last_stream_use != -1
-            self.current_sync.append(this_session_info.last_stream_use)
+            self.kv_swap_meta.append(KvCacheSwapMeta(SwapStatus.SYNCHRONIZED))
+            #self.current_sync.append(this_session_info.last_stream_use)
+            this_session_info.req_status = RequestStatus.INFO_REQ_ARR
         
     
     def try_load_kv_cache(self) -> None:
+        # need to make sure that previous cache load is sync or is swap_in
+        # otherwise might lead to cudamemory error
+        if(len(self.kv_swap_meta)> 0 and self.kv_swap_meta[-1].swap_status==SwapStatus.SWAP_OUT): 
+            # could not handle this case
+            # need to sync first
+            return
+            
         if len(self.waiting) + len(self.ready_refill) + len(self.wait_refill) == 0:
+            if(self.current_swap_status == SwapStatus.SWAP_OUT):
+                # if there are some refill requests waiting
+                # issue a sync first
+                self.kv_swap_meta.append(KvCacheSwapMeta(SwapStatus.SYNCHRONIZED))
+                return
+            # only proceed when self.kv_swap_meta contains only swap_in meta
+            not_proceed = any(kv_swap_meta.swap_status != SwapStatus.SWAP_IN for kv_swap_meta in self.kv_swap_meta)
+            if(not_proceed):
+                return
             # empty requests pending
+            new_kv_swap_meta = KvCacheSwapMeta(SwapStatus.SWAP_IN)
             while len(self.refill_requests) > 0:
                 refill_session_id = self.refill_requests[0]
                 if(self.session_dict[refill_session_id].block_status >=BlockStatus.SWAPPING_IN):
@@ -549,9 +594,28 @@ class Scheduler:
                     continue
                 # otherwise, try allocate it in gpu
                 this_session_info = self.session_dict[refill_session_id]
-                block_kv_cache = this_session_info.num_blocks
-                alloc_status = self.block_manager.can_allocate()
-                
+                num_block = this_session_info.seq_group.get_seqs()[0].n_blocks
+                alloc_status = self.block_manager.can_allocate_num_block(num_block)
+                assert alloc_status != AllocStatus.NEVER
+                if(alloc_status == AllocStatus.LATER):
+                    break
+                else:
+                    assert alloc_status == AllocStatus.OK
+                    # we can swap this sequence to gpu
+                    seq_group = self.session_dict[refill_session_id].seq_group
+                    mapping = self.block_manager.swap_in(seq_group=seq_group)
+                    stream_id = self.stream_avail.pop(0)
+                    stream_position = len(mapping)
+                    # need to extend the kvcacheSwapMeta
+                    new_kv_swap_meta.mapping.extend(mapping)
+                    new_kv_swap_meta.stream_list.append(stream_id)
+                    new_kv_swap_meta.stream_position.append(stream_position)
+                    #update session_dict
+                    this_session_info.last_stream_use = stream_id
+                    this_session_info.block_status = BlockStatus.SWAPPING_IN
+            if(len(new_kv_swap_meta.stream_list)> 0 ):
+                # append this meta to the deque
+                self.kv_swap_meta.append(new_kv_swap_meta)
                 
 
     def _schedule_running(

@@ -317,6 +317,22 @@ class BlockSpaceManagerV1(BlockSpaceManager):
             block_table.append(block)
 
         return block_table
+    
+    def can_allocate_num_block(self, num_block: int) -> AllocStatus:
+        num_required_blocks = num_block
+        if self.block_sliding_window is not None:
+            num_required_blocks = min(num_required_blocks,
+                                      self.block_sliding_window)
+        num_free_gpu_blocks = self.gpu_allocator.get_num_free_blocks()
+
+        # Use watermark to avoid frequent cache eviction.
+        if (self.num_total_gpu_blocks - num_required_blocks <
+                self.watermark_blocks):
+            return AllocStatus.NEVER
+        if num_free_gpu_blocks - num_required_blocks >= self.watermark_blocks:
+            return AllocStatus.OK
+        else:
+            return AllocStatus.LATER
 
     def allocate(self, seq_group: SequenceGroup) -> None:
         is_encoder_decoder = seq_group.is_encoder_decoder()
