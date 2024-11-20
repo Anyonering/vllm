@@ -43,6 +43,14 @@ class BlockAllocatorBase(ABC):
     @abstractmethod
     def free(self, block: PhysicalTokenBlock) -> None:
         pass
+    
+    @abstractmethod
+    def set_wait_free(self, block: PhysicalTokenBlock)-> None:
+        pass
+    
+    @abstractmethod 
+    def sync_free(self) -> None:
+        pass
 
     @abstractmethod
     def get_num_free_blocks(self) -> int:
@@ -171,6 +179,7 @@ class UncachedBlockAllocator(BlockAllocatorBase):
 
         # Initialize the free blocks.
         self.free_blocks: BlockTable = []
+        self.wait_for_free: BlockTable = []
         for i in range(num_blocks):
             block = PhysicalTokenBlock(device=device,
                                        block_number=i,
@@ -194,6 +203,14 @@ class UncachedBlockAllocator(BlockAllocatorBase):
         block.ref_count -= 1
         if block.ref_count == 0:
             self.free_blocks.append(block)
+            
+    def set_wait_free(self, block: PhysicalTokenBlock)-> None:
+        self.wait_for_free.append(block)
+        
+    def sync_free(self) -> None:
+        for block in self.wait_for_free:
+            self.free(block=block)
+        self.wait_for_free = []
 
     def get_num_free_blocks(self) -> int:
         return len(self.free_blocks)
@@ -596,6 +613,12 @@ class BlockSpaceManagerV1(BlockSpaceManager):
             return AllocStatus.OK
         else:
             return AllocStatus.LATER
+        
+    def sync_free_block_table(self, device: str):
+        if(device == 'cpu'):
+            self.cpu_allocator.sync_free()
+        else:
+            self.gpu_allocator.sync_free()
 
     def _swap_block_table(
             self, block_table: BlockTable, src_allocator: BlockAllocatorBase,
@@ -616,7 +639,7 @@ class BlockSpaceManagerV1(BlockSpaceManager):
                 mapping[from_block] = to_block
             new_block_table.append(to_block)
             # Free the source block swapped in to destination.
-            src_allocator.free(from_block)
+            src_allocator.set_wait_free(from_block)
 
         return new_block_table
 

@@ -25,10 +25,73 @@ ENABLE_ARTIFICIAL_PREEMPT = bool(
 ARTIFICIAL_PREEMPTION_PROB = 0.5
 ARTIFICIAL_PREEMPTION_MAX_CNT = 500
 
-KICKING = 0
-REFILLING = 1
-ON_DEVICE = 2
 
+@dataclass
+class BlockStatus(enum.Enum):
+    NOT_ALLOCATED = -1
+    RUNNING = 0
+    KICKING_OUT = 1
+    ON_HOST = 2
+    SWAPPING_IN = 3
+    ON_DEVICE = 4
+    
+@dataclass   
+class RequestStatus(enum.Enum):
+    NEW_ARRIVAL = 0
+    REQ_SCHEDULED = 1
+    TEMP_FINISHED = 2
+    INFO_REQ_ARR = 3
+    CHAT_REQ_ARR = 4
+    PERMANENT_FINISHED = 5
+    
+@dataclass
+class SessionStatus:
+    session_id: int
+    req_status: RequestStatus
+    block_status: BlockStatus
+    is_last_round: bool
+    seq_group: SequenceGroup
+    current_stream: int
+    
+    def __init__(self, session_id: int, seq_group: SequenceGroup):
+        self.session_id = session_id
+        self.seq_group = seq_group
+        self.req_status = RequestStatus.NEW_ARRIVAL
+        self.block_status = BlockStatus.NOT_ALLOCATED
+        self.current_stream = -1
+        self.is_last_round = False
+        
+@dataclass   
+class SwapStatus(enum.Enum):
+    SWAP_IN = enum.auto()
+    SWAP_OUT = enum.auto()
+    SYNCHRONIZED = enum.auto()
+    
+        
+@dataclass   
+class SetSessionBlockStatus:
+    session_id: int
+    block_status: BlockStatus  
+
+@dataclass   
+class KvCacheSwapMeta:   
+    swap_status: SwapStatus
+    mapping:  List[Tuple[int, int]]
+    stream_position: List[int]
+    stream_list: List[int]
+    sync_this_time: bool
+    #set_session: List[SetSessionBlockStatus]
+    
+    def __init__(self,swap_status:SwapStatus):
+        self.swap_status = swap_status
+        self.mapping = []
+        self.stream_list = []
+        self.stream_position = []
+        self.sync_this_time = False
+        #self.set_session = []
+
+
+    
 
 class PreemptionMode(enum.Enum):
     """Preemption modes.
@@ -344,11 +407,20 @@ class Scheduler:
         # Sequence groups in the SWAPPED state.
         # Contain decode requests that are swapped out.
         self.swapped: Deque[SequenceGroup] = deque()
-        # Sequence groups in the HUNG state.
+        # a dictionary that keeps track of general info about a client session
+        self.session_dict: Dict[int, SessionStatus] = {}
+        # sequence group that already have their context history loading in DRAM
+        # only need to allocate some blocks for new seqs tokens
+        self.ready_refill: Deque[SequenceGroup] = deque()
+        # sequence group that do not have their context history in DRAM but chat req has arrived
+        # need to allocate both context and new seq tokens
+        self.wait_refill: Deque[SequenceGroup] = deque()
+        # a deque to handle kv cache swapping
+        self.kv_swap_meta: Deque[KvCacheSwapMeta] = deque()
+        self.current_swap_status: SwapStatus = SwapStatus.SYNCHRONIZED
+        # Sequence groups temporarily finished.
         # Contain decode requests that are temporarily holding after finished.
-        self.hung: List[SequenceGroup] = list()
-        # Contain requests that are swapped out after finished.
-        self.finished_swapped: List[SequenceGroup] = list()
+        self.temp_finished: List[SequenceGroup] = list()
         # a list of sequence waiting to be freed
         self.wait_for_free : List[Sequence] = list()
         # This contains the session_id for the group waiting to be 
@@ -356,33 +428,21 @@ class Scheduler:
         # Temporarily configured by the user 
         # by changing llm.llm_engine.scheduler[0].refill_requests
         self.refill_requests: Deque[int] = deque()
-        # Contain requests that have already been reloaded back to device after finished.
-        self.refilled: List[SequenceGroup] = list()
-        # Sequence groups in the WAITING state with context.
-        # Contain new prefill requests with their history.
-        self.refill_wait: Deque[SequenceGroup] = deque()
         # Sequence groups finished requests ids since last step iteration.
         # It lets the model know that any state associated with these requests
         # can and must be released after the current step.
         self._finished_requests_ids: List[str] = list()
-        # the context request id of the refill_wait requests
-        self.context_req_id_ref: List[str] = list()
-        # cuda stream that are free to use
-        self.stream_list = [i for i in range(0,cache_config.num_stream)]
-        # a list of tuple (stream_id, req_id, kicking/refilling)
-        self.stream_in_use: List[Tuple] = list()
+        # cuda stream that are availabe to use
+        self.stream_avail = [i for i in range(0,cache_config.num_stream)]
+        # cuda streams that are currently being used in workers
+        self.stream_pend_sync = []
+        self.stream_to_session: Dict[int, SetSessionBlockStatus] = {}
         # Time at previous scheduling step
         self.prev_time = 0.0
         # Did we schedule a prompt at previous step?
         self.prev_prompt = False
         # Latency of the last prompt step 
         self.last_prompt_latency = 0.0
-        # Time at previous scheduling step in refilling
-        self.prev_time_refill = 0.0
-        # Did we schedule a prompt at previous step in refilling?
-        self.prev_prompt_refill = False
-        # Latency of the last prompt step in refill
-        self.last_prompt_latency_refill = 0.0
         # preemption mode, RECOMPUTE or SWAP
         self.user_specified_preemption_mode = scheduler_config.preemption_mode
         # The following field is test-only. It is used to inject artificial
@@ -395,9 +455,6 @@ class Scheduler:
         self.max_model_len = 2048
         self.cumulative_session_id = -1
         self.use_truncation = True
-        self.threshold_refill = 0
-        self.refill_info_dict: Dict[int, SeqGroupBlockInfo] = {}
-        self.pend_refill: List[SeqGroupWCounter] = list()
         self.is_finish_dict = {}
         self.time_in_scheduler = 0
 
@@ -412,43 +469,40 @@ class Scheduler:
 
     def add_seq_group(self, seq_group: SequenceGroup, session_id: int) -> None:
         is_refill = False
-        context_seq_group = None
-        for refill_seq_group in self.refilled:
-            if (refill_seq_group.session_id == session_id):
-                is_refill = True
-                context_seq_group = refill_seq_group
-                
-        print(f"adding seq group with session id{session_id}, refill: {is_refill}")
-        # print(f"refill info dict has length: {len(self.refill_info_dict)} , ",self.refill_info_dict)
+        seq_group.session_id = session_id
         if(self.is_finish_dict[session_id] == True):
             seq_group.is_last_round = True
-        # for key, value in self.refill_info_dict.items():
-        #     print(f"{key}: {value}")
-        if(is_refill):
-            seq_group.session_id = session_id
-            self.refill_wait.append(seq_group)
-            self.context_req_id_ref.append(context_seq_group.request_id)
+        if(self.session_dict.get(session_id) is not None):
+            is_refill = True
+            # this session has been tracked
+            # need to tell if it is ready or need kv cache reloading
+            session_info = self.session_dict.get(session_id) 
+            temp_block_status = session_info.block_status
+            assert temp_block_status > BlockStatus.KICKING_OUT
+            assert session_info.req_status >=RequestStatus.TEMP_FINISHED
+            if(temp_block_status == BlockStatus.ON_DEVICE):
+                # kv cache is loading, only need to allocate new seq tokens
+                self.ready_refill.append(seq_group)
+                session_info.req_status = RequestStatus.CHAT_REQ_ARR
+                session_info.is_last_round = seq_group.is_last_round
+            else:
+                # kv cache is still on Host RAM.
+                # need further processing
+                assert temp_block_status == BlockStatus.ON_HOST or temp_block_status == BlockStatus.SWAPPING_IN
+                self.wait_refill.append(seq_group)
+                session_info.is_last_round = seq_group.is_last_round
+                session_info.req_status = RequestStatus.CHAT_REQ_ARR
         else:
-            # It is possible that the seq_group needs refill but self.refill_wait 
-            # has not yet been updated
-            if(session_id in list( self.refill_info_dict.keys())):
-                # needs to check if the seq group in refill_info_dict is in KICKING
-                seq_info = self.refill_info_dict[session_id]
-                seq_group.session_id = session_id
-                if(seq_info.block_state == KICKING):
-                    self.refill_requests.append(session_id)
-                    self.pend_refill.append(SeqGroupWCounter(seq_group=seq_group,counter=1))
-                if(seq_info.block_state == ON_DEVICE):
-                    self.refill_requests.append(session_id)
-                    self.pend_refill.append(SeqGroupWCounter(seq_group=seq_group,counter=2))
-                    
-            else:    
-                # Add sequence groups to the waiting queue.
-                if(session_id > self.cumulative_session_id):
+            # this is a new session
+            if(session_id > self.cumulative_session_id):
                     # the given session id is greater than cumulative session id
-                    self.cumulative_session_id = session_id
-                seq_group.session_id = session_id
-                self.waiting.append(seq_group)
+                self.cumulative_session_id = session_id
+            self.waiting.append(seq_group)
+            self.session_dict[session_id] = SessionStatus(session_id=session_id,seq_group=seq_group)
+            self.session_dict[session_id].is_last_round = seq_group.is_last_round
+            
+        print(f"adding seq group with session id{session_id}, refill: {is_refill}")
+        # print(f"refill info dict has length: {len(self.refill_info_dict)} , ",self.refill_info_dict)
             
     def get_new_session_id(self, request_num: Optional[int] = None):
         if(request_num is None or request_num == 1):
@@ -499,17 +553,180 @@ class Scheduler:
 
     def has_unfinished_seqs(self) -> bool:
         return len(self.waiting) != 0 or len(self.running) != 0 or len(
-            self.swapped) != 0 or len(self.refill_wait) !=0 or len(self.pend_refill) != 0
+            self.swapped) != 0 or len(self.ready_refill) !=0 or len(self.wait_refill) != 0
 
     def get_num_unfinished_seq_groups(self) -> int:
-        return len(self.waiting) + len(self.running) + len(self.swapped) + len(self.refill_wait) + len(self.pend_refill)
+        return len(self.waiting) + len(self.running) + len(self.swapped) +len(self.ready_refill) + len(self.wait_refill)
 
     def get_and_reset_finished_requests_ids(self) -> List[str]:
         """Flushes the list of request ids of previously finished seq_groups."""
         finished_requests_ids = self._finished_requests_ids
         self._finished_requests_ids = list()
         return finished_requests_ids
-
+    #
+    # this function needs to be called from async_server
+    def sync_to_host(self, session_id) -> None:
+        # for sess_id in self.refill_requests:
+        this_session_info = self.session_dict[session_id]
+        assert this_session_info.block_status >=BlockStatus.KICKING_OUT
+        if(this_session_info.block_status == BlockStatus.KICKING_OUT):
+            assert this_session_info.current_stream != -1
+            self.kv_swap_meta.append(KvCacheSwapMeta(SwapStatus.SYNCHRONIZED))
+            #self.current_sync.append(this_session_info.last_stream_use)
+            this_session_info.req_status = RequestStatus.INFO_REQ_ARR
+        
+    # store kv cache to host memory
+    def try_store_kv_cache(self) -> None:
+        if(len(self.kv_swap_meta)> 0 and self.kv_swap_meta[-1].swap_status==SwapStatus.SWAP_IN):
+            # could not handle this case
+            # need to sync first
+            return
+        if(len(self.temp_finished)> 0):
+            if(self.current_swap_status == SwapStatus.SWAP_IN):
+                self.kv_swap_meta.append(KvCacheSwapMeta(SwapStatus.SYNCHRONIZED))
+                return
+            # only proceed when self.kv_swap_meta contains nothing or only swap_out meta
+            not_proceed = any(kv_swap_meta.swap_status == SwapStatus.SWAP_IN for kv_swap_meta in self.kv_swap_meta)
+            if(not_proceed):
+                return 
+            new_kv_swap_meta = KvCacheSwapMeta(SwapStatus.SWAP_IN)
+            while len(self.temp_finished) > 0:
+                seq_group = self.temp_finished[0]
+                session_id = self.temp_finished[0].session_id
+                this_session_info = self.session_dict[session_id]
+                assert this_session_info.block_status == BlockStatus.RUNNING
+                alloc_status = self.block_manager.can_swap_finished(seq_group)
+                assert alloc_status != AllocStatus.NEVER
+                if(alloc_status == AllocStatus.LATER):
+                    break
+                else:
+                    assert alloc_status == AllocStatus.OK
+                    mapping = self.block_manager.swap_out_finished(seq_group=seq_group)
+                    stream_id = self.stream_avail.pop(0)
+                    stream_position = len(mapping)
+                    # need to extend the kvcacheSwapMeta
+                    new_kv_swap_meta.mapping.extend(mapping)
+                    new_kv_swap_meta.stream_list.append(stream_id)
+                    new_kv_swap_meta.stream_position.append(stream_position)
+                    #update session_dict
+                    this_session_info.current_stream = stream_id
+                    this_session_info.block_status = BlockStatus.KICKING_OUT
+                    self.stream_to_session[stream_id] = SetSessionBlockStatus(session_id=session_id,block_status=BlockStatus.ON_HOST)
+            if(len(new_kv_swap_meta.stream_list)> 0 ):
+                # append this meta to the deque
+                self.kv_swap_meta.append(new_kv_swap_meta)
+                    
+    # load kv cache to device memory
+    def try_load_kv_cache(self) -> None:
+        # need to make sure that previous cache load is sync or is swap_in
+        # otherwise might lead to cudamemory error
+        if(len(self.kv_swap_meta)> 0 and self.kv_swap_meta[-1].swap_status==SwapStatus.SWAP_OUT): 
+            # could not handle this case
+            # need to sync first
+            return
+        # try to load kv cache of wait refill request
+        if(len(self.wait_refill)> 0):
+            if(self.current_swap_status == SwapStatus.SWAP_OUT):
+                # if there are some refill requests waiting
+                # issue a sync first
+                self.kv_swap_meta.append(KvCacheSwapMeta(SwapStatus.SYNCHRONIZED))
+                return
+            
+            not_proceed = any(kv_swap_meta.swap_status == SwapStatus.SWAP_OUT for kv_swap_meta in self.kv_swap_meta)
+            if(not_proceed):
+                return
+            new_kv_swap_meta = KvCacheSwapMeta(SwapStatus.SWAP_IN)
+            for refill_seq_group in self.wait_refill:
+                refill_session_id = refill_seq_group.session_id
+                if(self.session_dict[refill_session_id].block_status >=BlockStatus.SWAPPING_IN):
+                    continue
+                else:
+                    # need allocate on device memory
+                    assert self.session_dict[refill_session_id].block_status ==BlockStatus.ON_HOST
+                    this_session_info = self.session_dict[refill_session_id]
+                    num_block = this_session_info.seq_group.get_seqs()[0].n_blocks
+                    alloc_status = self.block_manager.can_allocate_num_block(num_block)
+                    assert alloc_status != AllocStatus.NEVER
+                    if(alloc_status == AllocStatus.LATER):
+                        break
+                    else:
+                        assert alloc_status == AllocStatus.OK
+                        # we can swap this sequence to gpu
+                        seq_group = self.session_dict[refill_session_id].seq_group
+                        mapping = self.block_manager.swap_in(seq_group=seq_group)
+                        stream_id = self.stream_avail.pop(0)
+                        stream_position = len(mapping)
+                        # need to extend the kvcacheSwapMeta
+                        new_kv_swap_meta.mapping.extend(mapping)
+                        new_kv_swap_meta.stream_list.append(stream_id)
+                        new_kv_swap_meta.stream_position.append(stream_position)
+                        new_kv_swap_meta.sync_this_time = True
+                        #update session_dict
+                        this_session_info.current_stream = stream_id
+                        this_session_info.block_status = BlockStatus.SWAPPING_IN
+                        self.stream_to_session[stream_id] = SetSessionBlockStatus(session_id=refill_session_id,block_status=BlockStatus.ON_DEVICE)
+                        # remove from self.refill_requests
+                        if(refill_session_id in self.refill_requests):
+                            self.refill_requests.remove(refill_session_id)
+            if(len(new_kv_swap_meta.stream_list)> 0 ):
+                # append this meta to the deque
+                self.kv_swap_meta.append(new_kv_swap_meta)
+                
+            return
+            
+        if len(self.waiting) + len(self.ready_refill) + len(self.wait_refill) == 0:
+            if(self.current_swap_status == SwapStatus.SWAP_OUT):
+                # if there are some refill requests waiting
+                # issue a sync first
+                self.kv_swap_meta.append(KvCacheSwapMeta(SwapStatus.SYNCHRONIZED))
+                return
+            # only proceed when self.kv_swap_meta contains only swap_in meta
+            not_proceed = any(kv_swap_meta.swap_status == SwapStatus.SWAP_OUT for kv_swap_meta in self.kv_swap_meta)
+            if(not_proceed):
+                return
+            # empty requests pending
+            new_kv_swap_meta = KvCacheSwapMeta(SwapStatus.SWAP_IN)
+            while len(self.refill_requests) > 0:
+                refill_session_id = self.refill_requests[0]
+                if(self.session_dict[refill_session_id].block_status >=BlockStatus.SWAPPING_IN):
+                    # already load, pop it
+                    self.refill_requests.popleft()
+                    continue
+                # otherwise, try allocate it in gpu
+                this_session_info = self.session_dict[refill_session_id]
+                num_block = this_session_info.seq_group.get_seqs()[0].n_blocks
+                alloc_status = self.block_manager.can_allocate_num_block(num_block)
+                assert alloc_status != AllocStatus.NEVER
+                if(alloc_status == AllocStatus.LATER):
+                    break
+                else:
+                    assert alloc_status == AllocStatus.OK
+                    # we can swap this sequence to gpu
+                    seq_group = self.session_dict[refill_session_id].seq_group
+                    mapping = self.block_manager.swap_in(seq_group=seq_group)
+                    stream_id = self.stream_avail.pop(0)
+                    stream_position = len(mapping)
+                    # need to extend the kvcacheSwapMeta
+                    new_kv_swap_meta.mapping.extend(mapping)
+                    new_kv_swap_meta.stream_list.append(stream_id)
+                    new_kv_swap_meta.stream_position.append(stream_position)
+                    #update session_dict
+                    this_session_info.current_stream = stream_id
+                    this_session_info.block_status = BlockStatus.SWAPPING_IN
+                    self.stream_to_session[stream_id] = SetSessionBlockStatus(session_id=refill_session_id,block_status=BlockStatus.ON_DEVICE)
+            if(len(new_kv_swap_meta.stream_list)> 0 ):
+                # append this meta to the deque
+                self.kv_swap_meta.append(new_kv_swap_meta)
+                
+    def _update_wait_refill(self) -> None:
+        # iterate through self.wait_refill
+        for r_wait_seq_group in list(self.wait_refill):
+            session_id = r_wait_seq_group.session_id
+            this_session_info = self.session_dict[session_id]
+            if(this_session_info.block_status == BlockStatus.ON_DEVICE):
+                self.wait_refill.remove(r_wait_seq_group)
+                self.ready_refill.append(r_wait_seq_group)
+            
     def _schedule_running(
         self,
         running_queue: deque,
@@ -599,8 +816,12 @@ class Scheduler:
                     preempted_mode = self._preempt(victim_seq_group,
                                                    blocks_to_swap_out)
                     if preempted_mode == PreemptionMode.RECOMPUTE:
+                        #
+                        session_id = victim_seq_group.session_id
+                        self.session_dict[session_id].block_status = BlockStatus.NOT_ALLOCATED
                         preempted.append(victim_seq_group)
                     else:
+                        # TODO: handle victim seq_group when swap out
                         swapped_out.append(victim_seq_group)
                 else:
                     # No other sequence groups can be preempted.
@@ -608,11 +829,15 @@ class Scheduler:
                     preempted_mode = self._preempt(seq_group,
                                                    blocks_to_swap_out)
                     if preempted_mode == PreemptionMode.RECOMPUTE:
+                        session_id = seq_group.session_id
+                        self.session_dict[session_id].block_status = BlockStatus.NOT_ALLOCATED
                         preempted.append(seq_group)
                     else:
                         swapped_out.append(seq_group)
                     break
             else:
+                session_id = seq_group.session_id
+                assert self.session_dict[session_id].block_status == BlockStatus.RUNNING
                 self._append_slots(seq_group, blocks_to_copy)
                 is_prefill = seq_group.is_prefill()
                 if is_prefill:
@@ -815,85 +1040,96 @@ class Scheduler:
         waiting_queue = deque([s for s in waiting_queue])
 
         leftover_waiting_sequences: Deque[SequenceGroup] = deque()
-        while self._passed_delay(time.time()) and waiting_queue:
-            seq_group = waiting_queue[0]
+        
+        # prioritized refill ready requests.
+        if len(self.ready_refill) > 0:
+            refills = self._schedule_refill(budget)
+        if(len(refills)> 0):
+            seq_groups = refills
+        else:
+            # schedule regular prefill
+            while self._passed_delay(time.time()) and waiting_queue:
+                seq_group = waiting_queue[0]
 
-            waiting_seqs = seq_group.get_seqs(status=SequenceStatus.WAITING)
-            assert len(waiting_seqs) == 1, (
-                "Waiting sequence group should have only one prompt "
-                "sequence.")
-            num_new_tokens = self._get_num_new_tokens(seq_group,
-                                                      SequenceStatus.WAITING,
-                                                      enable_chunking, budget)
-            if not enable_chunking:
-                num_prompt_tokens = waiting_seqs[0].get_len()
-                assert num_new_tokens == num_prompt_tokens
+                waiting_seqs = seq_group.get_seqs(status=SequenceStatus.WAITING)
+                assert len(waiting_seqs) == 1, (
+                    "Waiting sequence group should have only one prompt "
+                    "sequence.")
+                num_new_tokens = self._get_num_new_tokens(seq_group,
+                                                        SequenceStatus.WAITING,
+                                                        enable_chunking, budget)
+                if not enable_chunking:
+                    num_prompt_tokens = waiting_seqs[0].get_len()
+                    assert num_new_tokens == num_prompt_tokens
 
-            prompt_limit = self._get_prompt_limit(seq_group)
-            if num_new_tokens > prompt_limit:
-                logger.warning(
-                    "Input prompt (%d tokens) is too long"
-                    " and exceeds limit of %d", num_new_tokens, prompt_limit)
-                for seq in waiting_seqs:
-                    seq.status = SequenceStatus.FINISHED_IGNORED
-                ignored_seq_groups.append(seq_group)
-                waiting_queue.popleft()
-                continue
-
-            # If the sequence group cannot be allocated, stop.
-            can_allocate = self.block_manager.can_allocate(seq_group)
-            if can_allocate == AllocStatus.LATER:
-                # need to check self.refill_info_dict
-                new_seq = seq_group.get_seqs(status=SequenceStatus.WAITING)[0]
-                require_block_num = new_seq.n_blocks
-                self.swap_out_idle_seq(require_block_num)
-                break
-            elif can_allocate == AllocStatus.NEVER:
-                logger.warning(
-                    "Input prompt (%d tokens) is too long"
-                    " and exceeds the capacity of block_manager",
-                    num_new_tokens)
-                for seq in waiting_seqs:
-                    seq.status = SequenceStatus.FINISHED_IGNORED
-                ignored_seq_groups.append(seq_group)
-                waiting_queue.popleft()
-                continue
-
-            lora_int_id = 0
-            if self.lora_enabled:
-                lora_int_id = seq_group.lora_int_id
-                assert curr_loras is not None
-                assert self.lora_config is not None
-                if (self.lora_enabled and lora_int_id > 0
-                        and lora_int_id not in curr_loras
-                        and len(curr_loras) >= self.lora_config.max_loras):
-                    # We don't have a space for another LoRA, so
-                    # we ignore this request for now.
-                    leftover_waiting_sequences.appendleft(seq_group)
+                prompt_limit = self._get_prompt_limit(seq_group)
+                if num_new_tokens > prompt_limit:
+                    logger.warning(
+                        "Input prompt (%d tokens) is too long"
+                        " and exceeds limit of %d", num_new_tokens, prompt_limit)
+                    for seq in waiting_seqs:
+                        seq.status = SequenceStatus.FINISHED_IGNORED
+                    ignored_seq_groups.append(seq_group)
                     waiting_queue.popleft()
                     continue
 
-            num_new_seqs = seq_group.get_max_num_running_seqs()
-            if (num_new_tokens == 0
-                    or not budget.can_schedule(num_new_tokens=num_new_tokens,
-                                               num_new_seqs=num_new_seqs)):
-                break
+                # If the sequence group cannot be allocated, stop.
+                can_allocate = self.block_manager.can_allocate(seq_group)
+                if can_allocate == AllocStatus.LATER:
+                    # need to check self.refill_info_dict
+                    # new_seq = seq_group.get_seqs(status=SequenceStatus.WAITING)[0]
+                    # require_block_num = new_seq.n_blocks
+                    # self.swap_out_idle_seq(require_block_num)
+                    break
+                elif can_allocate == AllocStatus.NEVER:
+                    logger.warning(
+                        "Input prompt (%d tokens) is too long"
+                        " and exceeds the capacity of block_manager",
+                        num_new_tokens)
+                    for seq in waiting_seqs:
+                        seq.status = SequenceStatus.FINISHED_IGNORED
+                    ignored_seq_groups.append(seq_group)
+                    session_id = seq_group.session_id
+                    del self.session_dict[session_id]
+                    waiting_queue.popleft()
+                    continue
 
-            # Can schedule this request.
-            if curr_loras is not None and lora_int_id > 0:
-                curr_loras.add(lora_int_id)
-            waiting_queue.popleft()
-            self._allocate_and_set_running(seq_group)
-            seq_groups.append(
-                ScheduledSequenceGroup(seq_group=seq_group,
-                                       token_chunk_size=num_new_tokens))
-            num_blocks_seq = seq_group.get_seqs()[0].n_blocks
-            self.refill_info_dict[seq_group.session_id] = SeqGroupBlockInfo(seq_group,num_blocks_seq, -1, ON_DEVICE)
-            budget.add_num_batched_tokens(seq_group.request_id, num_new_tokens)
-            budget.add_num_seqs(seq_group.request_id, num_new_seqs)
+                lora_int_id = 0
+                if self.lora_enabled:
+                    lora_int_id = seq_group.lora_int_id
+                    assert curr_loras is not None
+                    assert self.lora_config is not None
+                    if (self.lora_enabled and lora_int_id > 0
+                            and lora_int_id not in curr_loras
+                            and len(curr_loras) >= self.lora_config.max_loras):
+                        # We don't have a space for another LoRA, so
+                        # we ignore this request for now.
+                        leftover_waiting_sequences.appendleft(seq_group)
+                        waiting_queue.popleft()
+                        continue
 
-        # Queue requests that couldn't be scheduled.
-        waiting_queue.extendleft(leftover_waiting_sequences)
+                num_new_seqs = seq_group.get_max_num_running_seqs()
+                if (num_new_tokens == 0
+                        or not budget.can_schedule(num_new_tokens=num_new_tokens,
+                                                num_new_seqs=num_new_seqs)):
+                    break
+
+                # Can schedule this request.
+                if curr_loras is not None and lora_int_id > 0:
+                    curr_loras.add(lora_int_id)
+                waiting_queue.popleft()
+                self._allocate_and_set_running(seq_group)
+                session_id = seq_group.session_id
+                self.session_dict[session_id].block_status = BlockStatus.RUNNING
+                self.session_dict[session_id].req_status = RequestStatus.REQ_SCHEDULED
+                seq_groups.append(
+                    ScheduledSequenceGroup(seq_group=seq_group,
+                                        token_chunk_size=num_new_tokens))
+                budget.add_num_batched_tokens(seq_group.request_id, num_new_tokens)
+                budget.add_num_seqs(seq_group.request_id, num_new_seqs)
+
+            # Queue requests that couldn't be scheduled.
+            waiting_queue.extendleft(leftover_waiting_sequences)
         if len(seq_groups) > 0:
             self.prev_prompt = True
 
@@ -930,7 +1166,7 @@ class Scheduler:
             self.running, SchedulerRunningOutputs.create_empty())
         remaining_swapped, swapped_in = (
             self.swapped, SchedulerSwappedInOutputs.create_empty())
-
+        
         # If any requests are swapped, prioritized swapped requests.
         if not self.swapped:
             remaining_waiting, prefills = self._schedule_prefills(
@@ -1121,205 +1357,77 @@ class Scheduler:
             num_lookahead_slots=self._get_num_lookahead_slots(is_prefill),
         )
         
-    def swap_out_idle_seq(self,num_blocks):
-        # swapping out num_blocks of page to provide space for new waiting requests
-        blocks_avail = 0
-        avail_sessions = []
-        for seq_group in self.refilled:
-            blocks_avail +=seq_group.get_seqs()[0].n_blocks
-            avail_sessions.append(seq_group)
-            if(blocks_avail >= num_blocks):
+    def _schedule_refill(self, budget: SchedulingBudget) -> List[ScheduledSequenceGroup]: 
+        refill_seq_groups: List[ScheduledSequenceGroup] = []
+        
+        while len(self.ready_refill) > 0:
+            new_seq_group = self.ready_refill[0]
+            session_id = new_seq_group.session_id
+            this_session_info = self.session_dict[session_id]
+            context_group = this_session_info.seq_group
+            assert len(new_seq_group.get_seqs(SequenceStatus.WAITING)) == 1 and len(context_group.get_seqs()) == 1 
+            assert this_session_info.block_status==BlockStatus.ON_DEVICE
+            new_seq = new_seq_group.get_seqs(SequenceStatus.WAITING)[0]
+            context_seq = context_group.get_seqs()[0]
+            sampling_params = new_seq_group.sampling_params
+            max_num_block = math.ceil(sampling_params.max_tokens/context_seq.block_size)
+            total_token_len = len(new_seq.data._prompt_token_ids[1:]) + context_seq.get_len()
+            seq_need_block = math.ceil( total_token_len/context_seq.block_size)
+            can_allocate = self.block_manager.append_slots_refill(context_seq,max_num_block,seq_need_block)
+            if(can_allocate==AllocStatus.LATER):
                 break
-        # for key, value in self.refill_info_dict.items():
-        #     if value.block_state == REFILLING:
-        #         blocks_avail +=value.num_blocks
-        #         avail_sessions.append(key)
-        #         if(blocks_avail >= num_blocks):
-        #             break
-        if(blocks_avail >= num_blocks):
-            # we can swap the blocks out 
-            self.hung.extend(avail_sessions)
-        return None
-    def refill_schedule(self)-> SchedulerOutputs:
-        ignored_seq_groups: List[SequenceGroup] = []
-        refill_seq_groups: List[SequenceGroup] = []
-        budget = SchedulingBudget(
-            token_budget=self.scheduler_config.max_num_batched_tokens,
-            max_num_seqs=self.scheduler_config.max_num_seqs,
-        )
-        for seq_group in self.running:
-            budget.add_num_seqs(seq_group.request_id,
-                                seq_group.get_max_num_running_seqs())
-        unsuccess: List[SequenceGroup] = []
-        unsuccess_context: List[SequenceGroup] = []
-        unsuccess_req_id: List[str] = []
-        while len(self.refill_wait) > 0 and len(self.context_req_id_ref) > 0:
-            context_req_id = self.context_req_id_ref.pop(0)
-            context_group = None
-            
-            seq_group = self.refill_wait.popleft()
-            seq_group.set_seq_group_status()
-            # num_new_tokens = self._get_num_new_tokens(seq_group,
-            #                                               SequenceStatus.WAITING,
-            #                                               enable_chunking=True, budget=budget)
-            num_new_seqs = seq_group.get_max_num_running_seqs()
-            temp_sync_stream = []
-            sampling_params = seq_group.sampling_params
-            
-            for refilled_group in self.refilled:
-                if(refilled_group.request_id == context_req_id):
-                    context_group = refilled_group
-                    break
-            if(context_group == None):
-                logger.warning("Context Sequence Group Not Found!")
-                unsuccess.append(seq_group)
-                unsuccess_req_id.append(context_req_id)
-                continue
-            else:
-                # print(len(seq_group.get_seqs(SequenceStatus.WAITING)))
-                # print(len(context_group.get_seqs()))
-                self.refilled.remove(context_group)
-                assert len(seq_group.get_seqs(SequenceStatus.WAITING)) == 1 and len(context_group.get_seqs()) == 1 
-                new_seq = seq_group.get_seqs(SequenceStatus.WAITING)[0]
-                context_seq = context_group.get_seqs()[0]
-                max_num_block = math.ceil(sampling_params.max_tokens/context_seq.block_size)
-                total_token_len = len(new_seq.data._prompt_token_ids[1:]) + context_seq.get_len()
-                seq_need_block = math.ceil( total_token_len/context_seq.block_size)
-                can_allocate = self.block_manager.append_slots_refill(context_seq,max_num_block,seq_need_block)
-                if(can_allocate==AllocStatus.LATER):
-                    unsuccess_context.append(context_group)
-                    unsuccess.append(seq_group)
-                    unsuccess_req_id.append(context_req_id)
-                    break
-                if(can_allocate==AllocStatus.NEVER):
-                    logger.warning(
-                    "Input prompt (%d tokens) is too long"
-                    " and exceeds the capacity of block_manager",
-                    num_new_tokens)
-                    context_seq.status = SequenceStatus.FINISHED_IGNORED
-                    ignored_seq_groups.append(context_group)
-                    unsuccess_context.append(context_group)
-                    continue
-                # otherwise we can allocate the new sequence with context
-                # need to update the new sequence group to include its context
-                context_group.set_seq_group_status()
-                context_group.sampling_params = seq_group.sampling_params
-                # print("context_group.sampling_params.logprobs: ",context_group.sampling_params.logprobs)
-                context_seq = context_group.get_seqs(SequenceStatus.WAITING)[0]
-                # print("original input len: ",len(context_seq.inputs['prompt_token_ids']))
-                context_seq.inputs['prompt_token_ids'].extend(context_seq.data._output_token_ids[:-1])
-                # print("plus output length: ",len(context_seq.inputs['prompt_token_ids']))
-                # print("original output last token id: ",context_seq.data._output_token_ids[-1])
-                # print("original output token id: ",context_seq.data._output_token_ids)
-                # print("context_seq.eos_token_id: ",context_seq.eos_token_id)
-                num_computed_tokens = len(context_seq.inputs['prompt_token_ids'])
-                # remainder_last_block = num_computed_tokens % context_seq.block_size
-                # num_computed_tokens -= num_computed_tokens % context_seq.block_size
-                new_seq = seq_group.get_seqs(SequenceStatus.WAITING)[0]
-                print(f"In refill_schedule, new seq has length {new_seq.data.get_len()}")
-                # print("new prompt length: ",new_seq.data.get_len())
-                # print("new prompt token id: ",new_seq.data._prompt_token_ids)
-                context_seq.inputs['prompt_token_ids'].extend(new_seq.data._prompt_token_ids[1:])
-                # print("final length: ",len(context_seq.inputs['prompt_token_ids']))
-                # print("original prefix offset: ",context_seq.prefix_offset)
-                # print("original read offset: ",context_seq.read_offset)
-                # # context_seq.prefix_offset += new_seq.data.get_len()-4
-                # print("scheduler prefix offset: ",context_seq.prefix_offset)
-                context_seq.status = SequenceStatus.RUNNING
-                context_seq.stop_reason = None
-                # print("context_seq output_logprobs: ",context_seq.output_logprobs)
-                # context_seq.output_logprobs = context_seq.output_logprobs[:-remainder_last_block]
-                context_seq.output_text = ""
-                old_data  = context_seq.data
-                context_seq.data = SequenceData(context_seq.inputs["prompt_token_ids"])
-                context_seq.data.truncated_len = old_data.truncated_len
-                # print("context_seq inputs token: ",context_seq.inputs["prompt_token_ids"])
-                context_seq.data._num_computed_tokens = old_data._num_computed_tokens
-                num_new_tokens = context_seq.get_num_new_tokens()
-                context_seq.tokens.pop()
-                context_seq.tokens.extend(new_seq.inputs['prompt'])
-                context_seq.read_offset = context_seq.prefix_offset+1
-                context_group.request_id = seq_group.request_id
-                context_group.is_last_round = seq_group.is_last_round
-                context_group.metrics = seq_group.metrics
-                # print("context seq tokens: ",context_seq.tokens)
-                print("num_new_tokens: ",num_new_tokens)
-                budget.add_num_batched_tokens(seq_group.request_id, num_new_tokens)
-                budget.add_num_seqs(seq_group.request_id, num_new_seqs)
-                # max_num_block = math.ceil(sampling_params.max_tokens/context_seq.block_size)
-                # # TODO
-                # # need to check if it can be allocated later
-                # can_allocate = self.block_manager.append_slots_refill(context_seq,max_num_blocks=max_num_block)
-                # if(can_allocate==AllocStatus.LATER):
-                #     break
-                # if(can_allocate==AllocStatus.NEVER):
-                #     logger.warning(
-                #     "Input prompt (%d tokens) is too long"
-                #     " and exceeds the capacity of block_manager",
-                #     num_new_tokens)
-                #     context_seq.status = SequenceStatus.FINISHED_IGNORED
-                #     ignored_seq_groups.append(context_group)
-                #     continue
-                
-                self.refill_info_dict[context_group.session_id].block_state = ON_DEVICE
-                
-                # need to check if prompt becomes too long
-                # if so, we need to truncate some part from it
-                if(context_seq.data.get_len()>=sampling_params.max_tokens):
-                    # print("hitting here \nhitting here \nhitting here \n")
-                    cur_len = context_seq.data.get_len()
-                    num_blocks_truncated = math.ceil((cur_len - sampling_params.max_tokens)/context_seq.block_size)
-                    if(cur_len - sampling_params.max_tokens) % context_seq.block_size == 0:
-                        num_blocks_truncated +=1
-                    self.block_manager.truncate_blocks(seq=context_seq,num=num_blocks_truncated)
-                    num_tokens_truncated = num_blocks_truncated * context_seq.block_size
-                    context_seq.data.truncated_len += num_tokens_truncated
-                    context_seq.truncated = True
-                    context_seq.read_offset -= num_tokens_truncated
-                    context_seq.prefix_offset -= num_tokens_truncated
-                    context_seq.data._num_computed_tokens -= num_tokens_truncated
-                    print(f"current length: {cur_len}")
-                    print(f"num block truncated: {num_blocks_truncated}")
-                    print(f"sequence truncated len: {context_seq.data.truncated_len}")
-                    print(f"\n\nnum tokens computed in refill: {context_seq.data._num_computed_tokens}\n\n")
-                self.running.extend([context_group])
-                print(f"Currently adding seq group: {context_group.session_id} and request id {context_group.request_id}\n\n, and has seqs{context_group.get_seqs()[0]}")
-                refill_seq_groups.append(ScheduledSequenceGroup(seq_group=context_group,token_chunk_size=num_new_tokens))
-                # print("context_seq block table: ",self.block_manager.get_block_table(context_seq))
-                for stream_info in self.stream_in_use:
-                    if(stream_info[1]==context_group.session_id):
-                        temp_sync_stream.append(stream_info)
-                        self.stream_list.append(stream_info[0])
-                        
-        self.stream_in_use = [stream_info for stream_info in self.stream_in_use if stream_info not in temp_sync_stream]
-        temp_sync_stream = [stream_info[0] for stream_info in temp_sync_stream]
-        self.refilled.extend(unsuccess_context)
-        self.refill_wait.extend(unsuccess)
-        self.context_req_id_ref.extend(unsuccess_req_id)
-        print("temp_sync_stream: ",temp_sync_stream)
-        print("length of scheduled refilled seq_group: ",len(refill_seq_groups))
-        # print("-----------------\n------------\n\n-----------\n\n---------")
-        if(len(refill_seq_groups)> 0):
-            self.prev_prompt_refill = True
-        return SchedulerOutputs(
-            scheduled_seq_groups=refill_seq_groups,
-            num_prefill_groups=len(refill_seq_groups),
-            num_batched_tokens=budget.num_batched_tokens,
-            blocks_to_swap_in=[],
-            blocks_to_swap_out=[],
-            blocks_to_kick_out=[],
-            blocks_to_refill=[],
-            kick_out_index=[],
-            refill_index=[],
-            stream_to_sync=temp_sync_stream,
-            kick_out_stream=[],
-            refill_stream=[],
-            blocks_to_copy=[],
-            ignored_seq_groups=ignored_seq_groups,
-            num_lookahead_slots=self._get_num_lookahead_slots(is_prefill=True),
-            running_queue_size=len(self.running),
-            preempted=0,
-        )
+            if(can_allocate==AllocStatus.NEVER):
+                logger.warning(
+                "Input prompt (%d tokens) is too long"
+                " and exceeds the capacity of block_manager",
+                new_seq_group.get_num_uncomputed_tokens())
+            # otherwise we can allocate the new sequence with context
+            # need to update the new sequence group to include its context
+            self.ready_refill.popleft()
+            context_group.set_seq_group_status()
+            context_group.sampling_params = new_seq_group.sampling_params
+            num_new_seqs = new_seq_group.get_max_num_running_seqs()
+            context_seq.inputs['prompt_token_ids'].extend(context_seq.data._output_token_ids[:-1])
+            context_seq.inputs['prompt_token_ids'].extend(new_seq.data._prompt_token_ids[1:])
+            context_seq.status = SequenceStatus.RUNNING
+            context_seq.stop_reason = None
+            context_seq.output_text = ""
+            old_data  = context_seq.data
+            context_seq.data = SequenceData(context_seq.inputs["prompt_token_ids"])
+            context_seq.data.truncated_len = old_data.truncated_len
+            context_seq.data._num_computed_tokens = old_data._num_computed_tokens
+            num_new_tokens = context_seq.get_num_new_tokens()
+            context_seq.tokens.pop()
+            context_seq.tokens.extend(new_seq.inputs['prompt'])
+            context_seq.read_offset = context_seq.prefix_offset+1
+            context_group.request_id = new_seq_group.request_id
+            context_group.is_last_round = new_seq_group.is_last_round
+            context_group.metrics = new_seq_group.metrics
+            budget.add_num_batched_tokens(new_seq_group.request_id, num_new_tokens)
+            budget.add_num_seqs(new_seq_group.request_id, num_new_seqs)
+            this_session_info.block_status = BlockStatus.RUNNING
+            this_session_info.req_status = RequestStatus.REQ_SCHEDULED
+            if(context_seq.data.get_len()>=sampling_params.max_tokens):
+                # print("hitting here \nhitting here \nhitting here \n")
+                cur_len = context_seq.data.get_len()
+                num_blocks_truncated = math.ceil((cur_len - sampling_params.max_tokens)/context_seq.block_size)
+                if(cur_len - sampling_params.max_tokens) % context_seq.block_size == 0:
+                    num_blocks_truncated +=1
+                self.block_manager.truncate_blocks(seq=context_seq,num=num_blocks_truncated)
+                num_tokens_truncated = num_blocks_truncated * context_seq.block_size
+                context_seq.data.truncated_len += num_tokens_truncated
+                context_seq.truncated = True
+                context_seq.read_offset -= num_tokens_truncated
+                context_seq.prefix_offset -= num_tokens_truncated
+                context_seq.data._num_computed_tokens -= num_tokens_truncated
+                # print(f"current length: {cur_len}")
+                # print(f"num block truncated: {num_blocks_truncated}")
+                # print(f"sequence truncated len: {context_seq.data.truncated_len}")
+                # print(f"\n\nnum tokens computed in refill: {context_seq.data._num_computed_tokens}\n\n")
+            refill_seq_groups.append(ScheduledSequenceGroup(seq_group=context_group,token_chunk_size=num_new_tokens))
+            this_session_info.seq_group = context_group
+        return refill_seq_groups
+
     def process_truncated_seqs(self)-> None:
         for seq_group in self.running:
             truncated_seqs = seq_group.get_seqs(SequenceStatus.TRUNCATED)
@@ -1333,6 +1441,66 @@ class Scheduler:
                     truncated_seq.data._num_computed_tokens -= truncated_seq.block_size
                     truncated_seq.read_offset -= truncated_seq.block_size
                     truncated_seq.prefix_offset -= truncated_seq.block_size
+                    
+    def process_kv_swap_meta(self, scheduler_outputs: SchedulerOutputs)-> None:
+        if len(self.kv_swap_meta) == 0:
+            # nothing to process
+            return
+        new_kv_meta = self.kv_swap_meta[0]
+        if(new_kv_meta.swap_status == SwapStatus.SYNCHRONIZED):
+            # TODO call synchronize
+            self.synchronize_stream(scheduler_outputs)
+            return
+        
+        if(new_kv_meta.swap_status == SwapStatus.SWAP_OUT):
+            if(self.current_swap_status == SwapStatus.SWAP_IN):
+                # TODO call synchronize
+                self.synchronize_stream(scheduler_outputs)
+                return
+            else:
+                # we can assume current_swap_status == SWAP_OUT or SYNCHRONIZED
+                scheduler_outputs.kick_out_index = new_kv_meta.stream_position
+                scheduler_outputs.blocks_to_kick_out = new_kv_meta.mapping
+                scheduler_outputs.kick_out_stream = new_kv_meta.stream_list
+                self.current_swap_status = SwapStatus.SWAP_OUT
+                self.stream_pend_sync.extend(new_kv_meta.stream_list)
+                if(new_kv_meta.sync_this_time):
+                    self.synchronize_stream(scheduler_outputs)
+                return
+            
+        if(new_kv_meta.swap_status == SwapStatus.SWAP_IN):
+            if(self.current_swap_status == SwapStatus.SWAP_OUT):
+                # TODO call synchronize
+                self.synchronize_stream(scheduler_outputs)
+                return
+            else:
+                scheduler_outputs.refill_index = new_kv_meta.stream_position
+                scheduler_outputs.blocks_to_refill = new_kv_meta.mapping
+                scheduler_outputs.refill_stream = new_kv_meta.stream_list
+                self.current_swap_status = SwapStatus.SWAP_IN
+                self.stream_pend_sync.extend(new_kv_meta.stream_list)
+                if(new_kv_meta.sync_this_time):
+                    self.synchronize_stream(scheduler_outputs)
+                return
+            
+            
+    def synchronize_stream(self, scheduler_outputs: SchedulerOutputs)-> None:
+        scheduler_outputs.stream_to_sync = [1]
+        if(self.current_swap_status == SwapStatus.SWAP_IN or self.current_swap_status == SwapStatus.SYNCHRONIZED):
+            self.block_manager.sync_free_block_table('cpu')
+        if(self.current_swap_status == SwapStatus.SWAP_OUT or self.current_swap_status == SwapStatus.SYNCHRONIZED):
+            self.block_manager.sync_free_block_table('gpu')
+        
+        for stream_id in self.stream_pend_sync:
+            set_action = self.stream_to_session[stream_id]
+            if(set_action != None and set_action.block_status != None):
+                self.session_dict[set_action.session_id].block_status = set_action.block_status
+            del self.stream_to_session[stream_id]
+            
+        self.stream_avail.extend(self.stream_pend_sync)
+        self.stream_pend_sync = []
+        self.current_swap_status = SwapStatus.SYNCHRONIZED
+            
 
     def schedule(self) -> Tuple[List[SequenceGroupMetadata], SchedulerOutputs]:
         # Schedule sequence groups.
@@ -1344,21 +1512,15 @@ class Scheduler:
         # need to handle truncated sequences first
         if(self.use_truncation):
             self.process_truncated_seqs()
-        scheduler_outputs = None
-        if(len(self.refill_wait)>0 and len(self.context_req_id_ref)>0) and self._passed_delay_refill(time.time()):
-            # print("entering refill schedulen\n\n\n\n\n\n\nentering refill schedule\n\n")
-            scheduler_outputs = self.refill_schedule()
-            if(len(scheduler_outputs.scheduled_seq_groups)== 0):
-                scheduler_outputs = self._schedule()
-        else: 
-            scheduler_outputs = self._schedule()
+        # scheduler_outputs = None
+        # if(len(self.refill_wait)>0 and len(self.context_req_id_ref)>0) and self._passed_delay_refill(time.time()):
+        #     # print("entering refill schedulen\n\n\n\n\n\n\nentering refill schedule\n\n")
+        #     scheduler_outputs = self.refill_schedule()
+        #     if(len(scheduler_outputs.scheduled_seq_groups)== 0):
+        #         scheduler_outputs = self._schedule()
+        # else: 
+        scheduler_outputs = self._schedule()
         now = time.time()
-        # if(self.refilling_mode):
-        #     print("scheduler_outputs")
-        # else:
-        #     print("something!!")
-        # Create input data structures.
-        # print("length of scheduled seq groups: ",len(scheduler_outputs.scheduled_seq_groups))
         seq_group_metadata_list: List[SequenceGroupMetadata] = []
         for i, scheduled_seq_group in enumerate(
                 scheduler_outputs.scheduled_seq_groups):
@@ -1376,7 +1538,6 @@ class Scheduler:
                 seq_data[seq_id] = seq.data
                 block_tables[seq_id] = self.block_manager.get_block_table(seq)
                 self.block_manager.access_all_blocks_in_seq(seq, now)
-                
                 # if(self.refilling_mode):
                     # print("output text: ",seq.output_text)
                     # print("output prob log: ",seq.output_logprobs)
@@ -1384,7 +1545,6 @@ class Scheduler:
                     # print("uncomputed: ", seq.data.get_num_uncomputed_tokens())
                     # print("seq length: ",seq.data.get_len())
                     # print()
-                    
 
             common_computed_block_nums = (
                 self.block_manager.get_common_computed_block_ids(
@@ -1441,122 +1601,13 @@ class Scheduler:
         for scheduled_seq_group in scheduler_outputs.scheduled_seq_groups:
             self.block_manager.mark_blocks_as_computed(
                 scheduled_seq_group.seq_group)
-        if(len(self.hung) > 0):
-            # print(f"self.hung contains {self.hung}")
-            # print("scheduler_outputs:\n scheduled_seq_groups: ",scheduler_outputs.scheduled_seq_groups)
-            # print("num_prefill_groups: ",scheduler_outputs.num_prefill_groups)
-            # print("num_batched_tokens: ",scheduler_outputs.num_batched_tokens)
-            # print("ignored_seq_groups: ", scheduler_outputs.ignored_seq_groups)
-            # print("num_lookahead_slots: ",scheduler_outputs.num_lookahead_slots)
-            # print("running_queue_size: ", scheduler_outputs.running_queue_size)
-            # print("preempted: ",scheduler_outputs.preempted)
-            while(len(self.hung) > 0):
-                seq_group = self.hung.pop()
-                if(self.block_manager.can_swap_out(seq_group)):
-                    mapping = self.block_manager.swap_out_finished(seq_group)
-                    stream_id = None
-                    found_in_stream = False
-                    # need to search in self.stream_in_use if that session has not been removed yet
-                    for stream_tuple in self.stream_in_use:
-                        if(stream_tuple[1]==seq_group.session_id):
-                            # pop that tuple from self.stream_in_use
-                            stream_id = stream_tuple[0]
-                            self.stream_in_use.remove(stream_tuple)
-                            found_in_stream = True
-                            break
-                    if(not found_in_stream):
-                        if(len(self.stream_list)> 0):
-                            stream_id = self.stream_list.pop(0)
-                        else:
-                            stream_id = self.stream_in_use[0][0]
-                    
-                    scheduler_outputs.kick_out_index.extend([len(mapping)])
-                    scheduler_outputs.blocks_to_kick_out.extend(mapping)
-                    scheduler_outputs.kick_out_stream.extend([stream_id])
-                    self.stream_in_use.append((stream_id,seq_group.session_id,KICKING))
-                    self.finished_swapped.append(seq_group)
-                    num_blocks_seq = seq_group.get_seqs()[0].n_blocks
-                    self.refill_info_dict[seq_group.session_id] = SeqGroupBlockInfo(seq_group,num_blocks_seq, stream_id, KICKING)
-                else:
-                    print("Running out of cpu blocks for hanging requests!")
-        if(len(self.finished_swapped)> 0 and len(self.refill_requests)> 0):
-            while(len(self.refill_requests)> 0):
-                temp_session_id = self.refill_requests.popleft()
-                temp_seq_group = None
-                find_one = False
-                for seq_group in self.finished_swapped: 
-                    print(f"searching for session_id {temp_session_id}, current checking session {seq_group.session_id}")
-                    if(seq_group.session_id == temp_session_id):
-                        find_one = True
-                        temp_seq_group = seq_group
-                        break
-                if(find_one and (temp_seq_group is not None)):
-                    aloc_status = self.block_manager.can_swap_finished(temp_seq_group)
-                    if(aloc_status==AllocStatus.OK):
-                        print("getting OK in allocate refill blocks\n\n")
-                        print(f"number of free blocks in gpu: {len(self.block_manager.gpu_allocator.free_blocks)}")
-                        print(f"seq group requires #{math.ceil((temp_seq_group.get_seqs()[0].get_len())/16) } blocks!")
-                        mapping = self.block_manager.swap_in_refill(temp_seq_group)
-                        stream_id = None
-                        has_finished_kick = True
-                        index_to_pop = None
-                        for stream_info in self.stream_in_use:
-                            if(stream_info[1]==temp_seq_group.session_id and stream_info[2]==KICKING):
-                                stream_id = stream_info[0]
-                                has_finished_kick = False
-                                index_to_pop = self.stream_in_use.index(stream_info)
-                                break
-                        if(has_finished_kick):
-                            if(len(self.stream_list)> 0):
-                                stream_id = self.stream_list.pop(0)
-                            else:
-                                stream_id = self.stream_in_use[0][0]
-                        else:
-                            self.stream_in_use.pop(index_to_pop)
-                            
-                        self.stream_in_use.append((stream_id,temp_seq_group.session_id,REFILLING))
-                        scheduler_outputs.refill_index.extend([len(mapping)])
-                        scheduler_outputs.blocks_to_refill.extend(mapping)
-                        scheduler_outputs.refill_stream.extend([stream_id])
-                        self.refilled.append(temp_seq_group)
-                        self.finished_swapped.remove(temp_seq_group)
-                        num_blocks_seq = temp_seq_group.get_seqs()[0].n_blocks
-                        self.refill_info_dict[temp_seq_group.session_id] = SeqGroupBlockInfo(temp_seq_group,num_blocks_seq, stream_id, REFILLING)
-                    else:
-                        print("Running out of gpu blocks for refill requests!")
-                        self.refill_requests.append(temp_session_id)
-                        break
-                else:
-                    print("Invalid request id!")
-                    print(f"session id {temp_session_id} is not found in finished_swapped seq group !")
-                    # self.refill_requests.append(temp_session_id)
-        # if(len(scheduler_outputs.blocks_to_refill)>0):
-        #     print("blocks to refill: ",scheduler_outputs.blocks_to_refill)
-        self.count_down_pending_refill()
+        self.try_store_kv_cache()
+        self.try_load_kv_cache()
+        self.process_kv_swap_meta(scheduler_outputs=scheduler_outputs)
+        self._update_wait_refill()
         self.time_in_scheduler +=time.time()-schedule_begin
         return seq_group_metadata_list, scheduler_outputs
 
-    def count_down_pending_refill(self) -> None:
-        for seq_info in self.pend_refill:
-            seq_info.counter -= 1
-        finish_counting = [x for x in self.pend_refill if x.counter <= 0]
-        if(len(finish_counting)> 0):
-            print("getting here\n\ngetting here\n\ngetting here\n\n")
-        self.pend_refill = [x for x in self.pend_refill if x.counter > 0]
-        # need to find context group for seq group in finish counting
-        for seq_info in finish_counting:
-            session_id = seq_info.seq_group.session_id
-            is_refill = False
-            context_seq_group = None
-            for refill_seq_group in self.refilled:
-                if (refill_seq_group.session_id == session_id):
-                    is_refill = True
-                    context_seq_group = refill_seq_group
-                    break
-            if(is_refill):
-                self.refill_wait.append(seq_info.seq_group)
-                self.context_req_id_ref.append(context_seq_group.request_id)
-                
     def fork_seq(self, parent_seq: Sequence, child_seq: Sequence) -> None:
         self.block_manager.fork(parent_seq, child_seq)
 
@@ -1582,11 +1633,14 @@ class Scheduler:
             ]
         need_to_free = [seq_group for queue in [self.running, self.swapped, self.waiting] for seq_group in queue
                              if (seq_group.is_finished() and seq_group.is_last_round)]
-        self.hung.extend(seq_group for queue in [self.running, self.swapped, self.waiting] for seq_group in queue
-                             if (seq_group.is_finished() and not seq_group.is_last_round))
+        new_finished = [seq_group for queue in [self.running, self.swapped, self.waiting] for seq_group in queue
+                             if (seq_group.is_finished() and not seq_group.is_last_round)]
+        for f_seq_group in new_finished:
+            self.session_dict[f_seq_group.session_id].req_status = RequestStatus.TEMP_FINISHED
+        self.temp_finished.extend(new_finished)
         self.running = deque(seq_group for seq_group in self.running
                              if not seq_group.is_finished())
-        temp_finished_seq_id = [seq_id for seq_group in self.hung for seq_id in seq_group.seqs_dict.keys() ]
+        temp_finished_seq_id = [seq_id for seq_group in self.temp_finished for seq_id in seq_group.seqs_dict.keys() ]
         # for seq_group in self.hung:
         #     for seq_id in seq_group.seqs_dict.keys():
         #         temp_finished_seq_id.append(seq_id) 
@@ -1599,6 +1653,8 @@ class Scheduler:
             for seq in instance_seq_group.get_seqs():
                 print(f"Free seq {seq.seq_id} !\n\n")
                 self.block_manager.free(seq)
+            session_id = instance_seq_group.session_id
+            del self.session_dict[session_id]
             
         self.wait_for_free = []
         

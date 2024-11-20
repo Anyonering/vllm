@@ -368,9 +368,10 @@ class Worker(LocalOrDistributedWorkerBase):
                 #         print(f"In layer {j}",torch.all(torch.eq(self.move_out_cache[j],self.move_in_cache[j])))
                 #         torch.save(self.move_out_cache[j],f"{my_folder}/worker_cache_{j}.pt")
         if(worker_input.stream_to_sync is not None and worker_input.stream_to_sync.numel() > 0):
-            print("stream_to_sync: ",worker_input.stream_to_sync)
-            for i in worker_input.stream_to_sync:
-                self.cache_stream_pool[i].synchronize()
+            torch.cuda.synchronize()
+            # print("stream_to_sync: ",worker_input.stream_to_sync)
+            # for i in worker_input.stream_to_sync:
+            #     self.cache_stream_pool[i].synchronize()
             
         # if(worker_input.blocks_to_kick_out is not None
         #         and worker_input.blocks_to_kick_out.numel() > 0 and

@@ -25,66 +25,10 @@ ENABLE_ARTIFICIAL_PREEMPT = bool(
 ARTIFICIAL_PREEMPTION_PROB = 0.5
 ARTIFICIAL_PREEMPTION_MAX_CNT = 500
 
+KICKING = 0
+REFILLING = 1
+ON_DEVICE = 2
 
-@dataclass
-class BlockStatus(enum.Enum):
-    NOT_ALLOCATED = -1
-    RUNNING = 0
-    KICKING_OUT = 1
-    ON_HOST = 2
-    SWAPPING_IN = 3
-    ON_DEVICE = 4
-    
-@dataclass   
-class RequestStatus(enum.Enum):
-    NEW_ARRIVAL = 0
-    REQ_SCHEDULED = 1
-    TEMP_FINISHED = 2
-    INFO_REQ_ARR = 3
-    CHAT_REQ_ARR = 4
-    PERMANENT_FINISHED = 5
-    
-@dataclass
-class SessionStatus:
-    session_id: int
-    req_status: RequestStatus
-    block_status: BlockStatus
-    is_last_round: bool
-    seq_group: SequenceGroup
-    num_blocks: int
-    last_stream_use: int
-    
-    def __init__(self, session_id: int, seq_group: SequenceGroup):
-        self.session_id = session_id
-        self.seq_group = seq_group
-        self.req_status = RequestStatus.NEW_ARRIVAL
-        self.block_status = BlockStatus.NOT_ALLOCATED
-        self.num_blocks = 0
-        self.last_stream_use = -1
-        self.is_last_round = False
-        
-@dataclass   
-class SwapStatus(enum.Enum):
-    SWAP_IN = enum.auto()
-    SWAP_OUT = enum.auto()
-    SYNCHRONIZED = enum.auto()
-
-@dataclass   
-class KvCacheSwapMeta:   
-    swap_status: SwapStatus
-    mapping:  List[Tuple[int, int]]
-    stream_position: List[int]
-    stream_list: List[int]
-    sync_this_time: bool
-    
-    def __init__(self,swap_status:SwapStatus):
-        self.swap_status = swap_status
-        self.mapping = []
-        self.stream_list = []
-        self.stream_position = []
-        self.sync_this_time = False
-
-    
 
 class PreemptionMode(enum.Enum):
     """Preemption modes.
@@ -400,20 +344,11 @@ class Scheduler:
         # Sequence groups in the SWAPPED state.
         # Contain decode requests that are swapped out.
         self.swapped: Deque[SequenceGroup] = deque()
-        # a dictionary that keeps track of general info about a client session
-        self.session_dict: Dict[int, SessionStatus] = {}
-        # sequence group that already have their context history loading in DRAM
-        # only need to allocate some blocks for new seqs tokens
-        self.ready_refill: Deque[SequenceGroup] = deque()
-        # sequence group that do not have their context history in DRAM but chat req has arrived
-        # need to allocate both context and new seq tokens
-        self.wait_refill: Deque[SequenceGroup] = deque()
-        # a deque to handle kv cache swapping
-        self.kv_swap_meta: Deque[KvCacheSwapMeta] = deque()
-        self.current_swap_status: SwapStatus = SwapStatus.SYNCHRONIZED
-        # Sequence groups temporarily finished.
+        # Sequence groups in the HUNG state.
         # Contain decode requests that are temporarily holding after finished.
-        self.temp_finished: List[int] = list()
+        self.hung: List[SequenceGroup] = list()
+        # Contain requests that are swapped out after finished.
+        self.finished_swapped: List[SequenceGroup] = list()
         # a list of sequence waiting to be freed
         self.wait_for_free : List[Sequence] = list()
         # This contains the session_id for the group waiting to be 
@@ -421,20 +356,33 @@ class Scheduler:
         # Temporarily configured by the user 
         # by changing llm.llm_engine.scheduler[0].refill_requests
         self.refill_requests: Deque[int] = deque()
+        # Contain requests that have already been reloaded back to device after finished.
+        self.refilled: List[SequenceGroup] = list()
+        # Sequence groups in the WAITING state with context.
+        # Contain new prefill requests with their history.
+        self.refill_wait: Deque[SequenceGroup] = deque()
         # Sequence groups finished requests ids since last step iteration.
         # It lets the model know that any state associated with these requests
         # can and must be released after the current step.
         self._finished_requests_ids: List[str] = list()
-        # cuda stream that are availabe to use
-        self.stream_avail = [i for i in range(0,cache_config.num_stream)]
-        # cuda streams that are currently being used in workers
-        self.stream_in_use = []
+        # the context request id of the refill_wait requests
+        self.context_req_id_ref: List[str] = list()
+        # cuda stream that are free to use
+        self.stream_list = [i for i in range(0,cache_config.num_stream)]
+        # a list of tuple (stream_id, req_id, kicking/refilling)
+        self.stream_in_use: List[Tuple] = list()
         # Time at previous scheduling step
         self.prev_time = 0.0
         # Did we schedule a prompt at previous step?
         self.prev_prompt = False
         # Latency of the last prompt step 
         self.last_prompt_latency = 0.0
+        # Time at previous scheduling step in refilling
+        self.prev_time_refill = 0.0
+        # Did we schedule a prompt at previous step in refilling?
+        self.prev_prompt_refill = False
+        # Latency of the last prompt step in refill
+        self.last_prompt_latency_refill = 0.0
         # preemption mode, RECOMPUTE or SWAP
         self.user_specified_preemption_mode = scheduler_config.preemption_mode
         # The following field is test-only. It is used to inject artificial
@@ -447,6 +395,9 @@ class Scheduler:
         self.max_model_len = 2048
         self.cumulative_session_id = -1
         self.use_truncation = True
+        self.threshold_refill = 0
+        self.refill_info_dict: Dict[int, SeqGroupBlockInfo] = {}
+        self.pend_refill: List[SeqGroupWCounter] = list()
         self.is_finish_dict = {}
         self.time_in_scheduler = 0
 
@@ -461,38 +412,43 @@ class Scheduler:
 
     def add_seq_group(self, seq_group: SequenceGroup, session_id: int) -> None:
         is_refill = False
-        seq_group.session_id = session_id
-        if(self.is_finish_dict[session_id] == True):
-            seq_group.is_last_round = True
-        if(self.session_dict.get(session_id) is not None):
-            is_refill = True
-            # this session has been tracked
-            # need to tell if it is ready or need kv cache reloading
-            session_info = self.session_dict.get(session_id) 
-            temp_block_status = session_info.block_status
-            assert temp_block_status >= BlockStatus.ON_HOST
-            assert session_info.req_status >=RequestStatus.TEMP_FINISHED
-            if(temp_block_status >= BlockStatus.SWAPPING_IN):
-                # kv cache is loading, only need to allocate new seq tokens
-                self.ready_refill.append(seq_group)
-                session_info.req_status = RequestStatus.CHAT_REQ_ARR
-            else:
-                # kv cache is still on Host RAM.
-                # need further processing
-                assert temp_block_status == BlockStatus.ON_HOST
-                self.wait_refill.append(seq_group)
-                session_info.req_status = RequestStatus.CHAT_REQ_ARR
-        else:
-            # this is a new session
-            if(session_id > self.cumulative_session_id):
-                    # the given session id is greater than cumulative session id
-                self.cumulative_session_id = session_id
-            self.waiting.append(seq_group)
-            self.session_dict[session_id] = SessionStatus(session_id=session_id,seq_group=seq_group)
-            self.session_dict[session_id].is_last_round = seq_group.is_last_round
-            
+        context_seq_group = None
+        for refill_seq_group in self.refilled:
+            if (refill_seq_group.session_id == session_id):
+                is_refill = True
+                context_seq_group = refill_seq_group
+                
         print(f"adding seq group with session id{session_id}, refill: {is_refill}")
         # print(f"refill info dict has length: {len(self.refill_info_dict)} , ",self.refill_info_dict)
+        if(self.is_finish_dict[session_id] == True):
+            seq_group.is_last_round = True
+        # for key, value in self.refill_info_dict.items():
+        #     print(f"{key}: {value}")
+        if(is_refill):
+            seq_group.session_id = session_id
+            self.refill_wait.append(seq_group)
+            self.context_req_id_ref.append(context_seq_group.request_id)
+        else:
+            # It is possible that the seq_group needs refill but self.refill_wait 
+            # has not yet been updated
+            if(session_id in list( self.refill_info_dict.keys())):
+                # needs to check if the seq group in refill_info_dict is in KICKING
+                seq_info = self.refill_info_dict[session_id]
+                seq_group.session_id = session_id
+                if(seq_info.block_state == KICKING):
+                    self.refill_requests.append(session_id)
+                    self.pend_refill.append(SeqGroupWCounter(seq_group=seq_group,counter=1))
+                if(seq_info.block_state == ON_DEVICE):
+                    self.refill_requests.append(session_id)
+                    self.pend_refill.append(SeqGroupWCounter(seq_group=seq_group,counter=2))
+                    
+            else:    
+                # Add sequence groups to the waiting queue.
+                if(session_id > self.cumulative_session_id):
+                    # the given session id is greater than cumulative session id
+                    self.cumulative_session_id = session_id
+                seq_group.session_id = session_id
+                self.waiting.append(seq_group)
             
     def get_new_session_id(self, request_num: Optional[int] = None):
         if(request_num is None or request_num == 1):
@@ -543,80 +499,16 @@ class Scheduler:
 
     def has_unfinished_seqs(self) -> bool:
         return len(self.waiting) != 0 or len(self.running) != 0 or len(
-            self.swapped) != 0 or len(self.ready_refill) !=0 or len(self.wait_refill) != 0
+            self.swapped) != 0 or len(self.refill_wait) !=0 or len(self.pend_refill) != 0
 
     def get_num_unfinished_seq_groups(self) -> int:
-        return len(self.waiting) + len(self.running) + len(self.swapped) +len(self.ready_refill) + len(self.wait_refill)
+        return len(self.waiting) + len(self.running) + len(self.swapped) + len(self.refill_wait) + len(self.pend_refill)
 
     def get_and_reset_finished_requests_ids(self) -> List[str]:
         """Flushes the list of request ids of previously finished seq_groups."""
         finished_requests_ids = self._finished_requests_ids
         self._finished_requests_ids = list()
         return finished_requests_ids
-    #
-    # this function needs to be called from async_server
-    def sync_to_host(self, session_id) -> None:
-        # for sess_id in self.refill_requests:
-        this_session_info = self.session_dict[session_id]
-        assert this_session_info.block_status >=BlockStatus.KICKING_OUT
-        if(this_session_info.block_status == BlockStatus.KICKING_OUT):
-            assert this_session_info.last_stream_use != -1
-            self.kv_swap_meta.append(KvCacheSwapMeta(SwapStatus.SYNCHRONIZED))
-            #self.current_sync.append(this_session_info.last_stream_use)
-            this_session_info.req_status = RequestStatus.INFO_REQ_ARR
-        
-    
-    def try_load_kv_cache(self) -> None:
-        # need to make sure that previous cache load is sync or is swap_in
-        # otherwise might lead to cudamemory error
-        if(len(self.kv_swap_meta)> 0 and self.kv_swap_meta[-1].swap_status==SwapStatus.SWAP_OUT): 
-            # could not handle this case
-            # need to sync first
-            return
-            
-        if len(self.waiting) + len(self.ready_refill) + len(self.wait_refill) == 0:
-            if(self.current_swap_status == SwapStatus.SWAP_OUT):
-                # if there are some refill requests waiting
-                # issue a sync first
-                self.kv_swap_meta.append(KvCacheSwapMeta(SwapStatus.SYNCHRONIZED))
-                return
-            # only proceed when self.kv_swap_meta contains only swap_in meta
-            not_proceed = any(kv_swap_meta.swap_status != SwapStatus.SWAP_IN for kv_swap_meta in self.kv_swap_meta)
-            if(not_proceed):
-                return
-            # empty requests pending
-            new_kv_swap_meta = KvCacheSwapMeta(SwapStatus.SWAP_IN)
-            while len(self.refill_requests) > 0:
-                refill_session_id = self.refill_requests[0]
-                if(self.session_dict[refill_session_id].block_status >=BlockStatus.SWAPPING_IN):
-                    # already load, pop it
-                    self.refill_requests.popleft()
-                    continue
-                # otherwise, try allocate it in gpu
-                this_session_info = self.session_dict[refill_session_id]
-                num_block = this_session_info.seq_group.get_seqs()[0].n_blocks
-                alloc_status = self.block_manager.can_allocate_num_block(num_block)
-                assert alloc_status != AllocStatus.NEVER
-                if(alloc_status == AllocStatus.LATER):
-                    break
-                else:
-                    assert alloc_status == AllocStatus.OK
-                    # we can swap this sequence to gpu
-                    seq_group = self.session_dict[refill_session_id].seq_group
-                    mapping = self.block_manager.swap_in(seq_group=seq_group)
-                    stream_id = self.stream_avail.pop(0)
-                    stream_position = len(mapping)
-                    # need to extend the kvcacheSwapMeta
-                    new_kv_swap_meta.mapping.extend(mapping)
-                    new_kv_swap_meta.stream_list.append(stream_id)
-                    new_kv_swap_meta.stream_position.append(stream_position)
-                    #update session_dict
-                    this_session_info.last_stream_use = stream_id
-                    this_session_info.block_status = BlockStatus.SWAPPING_IN
-            if(len(new_kv_swap_meta.stream_list)> 0 ):
-                # append this meta to the deque
-                self.kv_swap_meta.append(new_kv_swap_meta)
-                
 
     def _schedule_running(
         self,
