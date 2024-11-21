@@ -26,8 +26,29 @@ ARTIFICIAL_PREEMPTION_PROB = 0.5
 ARTIFICIAL_PREEMPTION_MAX_CNT = 500
 
 
-@dataclass
-class BlockStatus(enum.Enum):
+class ComparableEnum(enum.Enum):
+    def __lt__(self, other):
+        if self.__class__ is other.__class__:
+            return self.value < other.value
+        return NotImplemented
+
+    def __le__(self, other):
+        if self.__class__ is other.__class__:
+            return self.value <= other.value
+        return NotImplemented
+
+    def __gt__(self, other):
+        if self.__class__ is other.__class__:
+            return self.value > other.value
+        return NotImplemented
+
+    def __ge__(self, other):
+        if self.__class__ is other.__class__:
+            return self.value >= other.value
+        return NotImplemented
+
+
+class BlockStatus(ComparableEnum):
     NOT_ALLOCATED = -1
     RUNNING = 0
     KICKING_OUT = 1
@@ -35,8 +56,8 @@ class BlockStatus(enum.Enum):
     SWAPPING_IN = 3
     ON_DEVICE = 4
     
-@dataclass   
-class RequestStatus(enum.Enum):
+ 
+class RequestStatus(ComparableEnum):
     NEW_ARRIVAL = 0
     REQ_SCHEDULED = 1
     TEMP_FINISHED = 2
@@ -61,7 +82,7 @@ class SessionStatus:
         self.current_stream = -1
         self.is_last_round = False
         
-@dataclass   
+  
 class SwapStatus(enum.Enum):
     SWAP_IN = enum.auto()
     SWAP_OUT = enum.auto()
@@ -568,6 +589,9 @@ class Scheduler:
     def sync_to_host(self, session_id) -> None:
         # for sess_id in self.refill_requests:
         this_session_info = self.session_dict[session_id]
+        print(f"This session {session_id} has block status: {this_session_info.block_status}")
+        # print(f"self.temp_finished:{self.temp_finished}")
+        
         assert this_session_info.block_status >=BlockStatus.KICKING_OUT
         if(this_session_info.block_status == BlockStatus.KICKING_OUT):
             assert this_session_info.current_stream != -1
@@ -581,19 +605,32 @@ class Scheduler:
             # could not handle this case
             # need to sync first
             return
+        # print("getting here line 606")
+        
         if(len(self.temp_finished)> 0):
+            # print("getting here line 610")
+            # print(f"current swap status: {self.current_swap_status}")
             if(self.current_swap_status == SwapStatus.SWAP_IN):
-                self.kv_swap_meta.append(KvCacheSwapMeta(SwapStatus.SYNCHRONIZED))
+                # print("getting here line 613")
+                # print(f"self.current_swap_status: {self.current_swap_status}")
+                # print(f"{self.current_swap_status == SwapStatus.SWAP_IN}")
+                if len(self.kv_swap_meta)> 0:
+                    self.kv_swap_meta[-1].sync_this_time = True
+                else:
+                    self.kv_swap_meta.append(KvCacheSwapMeta(SwapStatus.SYNCHRONIZED))
                 return
+            # print("getting here line 616")
             # only proceed when self.kv_swap_meta contains nothing or only swap_out meta
             not_proceed = any(kv_swap_meta.swap_status == SwapStatus.SWAP_IN for kv_swap_meta in self.kv_swap_meta)
             if(not_proceed):
                 return 
-            new_kv_swap_meta = KvCacheSwapMeta(SwapStatus.SWAP_IN)
+            # print("getting here line 617")
+            new_kv_swap_meta = KvCacheSwapMeta(SwapStatus.SWAP_OUT)
             while len(self.temp_finished) > 0:
                 seq_group = self.temp_finished[0]
                 session_id = self.temp_finished[0].session_id
                 this_session_info = self.session_dict[session_id]
+                # print("getting here at 624")
                 assert this_session_info.block_status == BlockStatus.RUNNING
                 alloc_status = self.block_manager.can_swap_finished(seq_group)
                 assert alloc_status != AllocStatus.NEVER
@@ -611,7 +648,10 @@ class Scheduler:
                     #update session_dict
                     this_session_info.current_stream = stream_id
                     this_session_info.block_status = BlockStatus.KICKING_OUT
+                    # print(f"\n\n\nsetting session {session_id} to kikcing out\n\n\n")
                     self.stream_to_session[stream_id] = SetSessionBlockStatus(session_id=session_id,block_status=BlockStatus.ON_HOST)
+                    # print(f"setting stream {stream_id} maps to action: {session_id} to BlockStatus.ON_HOST")
+                    self.temp_finished.pop(0)
             if(len(new_kv_swap_meta.stream_list)> 0 ):
                 # append this meta to the deque
                 self.kv_swap_meta.append(new_kv_swap_meta)
@@ -629,8 +669,19 @@ class Scheduler:
             if(self.current_swap_status == SwapStatus.SWAP_OUT):
                 # if there are some refill requests waiting
                 # issue a sync first
-                self.kv_swap_meta.append(KvCacheSwapMeta(SwapStatus.SYNCHRONIZED))
+                if len(self.kv_swap_meta)> 0:
+                    self.kv_swap_meta[-1].sync_this_time = True
+                else:
+                    self.kv_swap_meta.append(KvCacheSwapMeta(SwapStatus.SYNCHRONIZED))
                 return
+                # if len(self.kv_swap_meta)> 0:
+                #     if self.kv_swap_meta[-1].swap_status != SwapStatus.SYNCHRONIZED and self.kv_swap_meta[-1].sync_this_time == False:
+                #         self.kv_swap_meta.append(KvCacheSwapMeta(SwapStatus.SYNCHRONIZED))
+                #     else:
+                #         return
+                # else:
+                #     self.kv_swap_meta.append(KvCacheSwapMeta(SwapStatus.SYNCHRONIZED))
+                # return
             
             not_proceed = any(kv_swap_meta.swap_status == SwapStatus.SWAP_OUT for kv_swap_meta in self.kv_swap_meta)
             if(not_proceed):
@@ -653,7 +704,7 @@ class Scheduler:
                         assert alloc_status == AllocStatus.OK
                         # we can swap this sequence to gpu
                         seq_group = self.session_dict[refill_session_id].seq_group
-                        mapping = self.block_manager.swap_in(seq_group=seq_group)
+                        mapping = self.block_manager.swap_in_refill(seq_group=seq_group)
                         stream_id = self.stream_avail.pop(0)
                         stream_position = len(mapping)
                         # need to extend the kvcacheSwapMeta
@@ -661,10 +712,13 @@ class Scheduler:
                         new_kv_swap_meta.stream_list.append(stream_id)
                         new_kv_swap_meta.stream_position.append(stream_position)
                         new_kv_swap_meta.sync_this_time = True
+                        # print(f"In session {refill_session_id} setting new_kv_swap_meta: mapping:{mapping}")
+                        # print(f"In session {refill_session_id} setting new_kv_swap_meta: refill_stream:{stream_id}")
                         #update session_dict
                         this_session_info.current_stream = stream_id
                         this_session_info.block_status = BlockStatus.SWAPPING_IN
                         self.stream_to_session[stream_id] = SetSessionBlockStatus(session_id=refill_session_id,block_status=BlockStatus.ON_DEVICE)
+                        # print(f"setting stream {stream_id} maps to action: {refill_session_id} to BlockStatus.ON_DEVICE")
                         # remove from self.refill_requests
                         if(refill_session_id in self.refill_requests):
                             self.refill_requests.remove(refill_session_id)
@@ -678,8 +732,13 @@ class Scheduler:
             if(self.current_swap_status == SwapStatus.SWAP_OUT):
                 # if there are some refill requests waiting
                 # issue a sync first
-                self.kv_swap_meta.append(KvCacheSwapMeta(SwapStatus.SYNCHRONIZED))
+                if len(self.kv_swap_meta)> 0:
+                    self.kv_swap_meta[-1].sync_this_time = True
+                else:
+                    self.kv_swap_meta.append(KvCacheSwapMeta(SwapStatus.SYNCHRONIZED))
                 return
+                # self.kv_swap_meta.append(KvCacheSwapMeta(SwapStatus.SYNCHRONIZED))
+                # return
             # only proceed when self.kv_swap_meta contains only swap_in meta
             not_proceed = any(kv_swap_meta.swap_status == SwapStatus.SWAP_OUT for kv_swap_meta in self.kv_swap_meta)
             if(not_proceed):
@@ -703,17 +762,20 @@ class Scheduler:
                     assert alloc_status == AllocStatus.OK
                     # we can swap this sequence to gpu
                     seq_group = self.session_dict[refill_session_id].seq_group
-                    mapping = self.block_manager.swap_in(seq_group=seq_group)
+                    mapping = self.block_manager.swap_in_refill(seq_group=seq_group)
                     stream_id = self.stream_avail.pop(0)
                     stream_position = len(mapping)
                     # need to extend the kvcacheSwapMeta
                     new_kv_swap_meta.mapping.extend(mapping)
                     new_kv_swap_meta.stream_list.append(stream_id)
                     new_kv_swap_meta.stream_position.append(stream_position)
+                    # print(f"In session {refill_session_id} setting new_kv_swap_meta: mapping:{mapping}")
+                    # print(f"In session {refill_session_id} setting new_kv_swap_meta: refill_stream:{stream_id}")
                     #update session_dict
                     this_session_info.current_stream = stream_id
                     this_session_info.block_status = BlockStatus.SWAPPING_IN
                     self.stream_to_session[stream_id] = SetSessionBlockStatus(session_id=refill_session_id,block_status=BlockStatus.ON_DEVICE)
+                    # print(f"setting stream {stream_id} maps to action: {refill_session_id} to BlockStatus.ON_DEVICE")
             if(len(new_kv_swap_meta.stream_list)> 0 ):
                 # append this meta to the deque
                 self.kv_swap_meta.append(new_kv_swap_meta)
@@ -1044,8 +1106,8 @@ class Scheduler:
         # prioritized refill ready requests.
         if len(self.ready_refill) > 0:
             refills = self._schedule_refill(budget)
-        if(len(refills)> 0):
-            seq_groups = refills
+            if(len(refills)> 0):
+                seq_groups = refills
         else:
             # schedule regular prefill
             while self._passed_delay(time.time()) and waiting_queue:
@@ -1450,12 +1512,15 @@ class Scheduler:
         if(new_kv_meta.swap_status == SwapStatus.SYNCHRONIZED):
             # TODO call synchronize
             self.synchronize_stream(scheduler_outputs)
+            # print(f"len(self.kv_swap_meta): {len(self.kv_swap_meta)}")
+            self.kv_swap_meta.popleft()
             return
         
         if(new_kv_meta.swap_status == SwapStatus.SWAP_OUT):
             if(self.current_swap_status == SwapStatus.SWAP_IN):
                 # TODO call synchronize
                 self.synchronize_stream(scheduler_outputs)
+                # print(f"len(self.kv_swap_meta): {len(self.kv_swap_meta)}")
                 return
             else:
                 # we can assume current_swap_status == SWAP_OUT or SYNCHRONIZED
@@ -1466,21 +1531,29 @@ class Scheduler:
                 self.stream_pend_sync.extend(new_kv_meta.stream_list)
                 if(new_kv_meta.sync_this_time):
                     self.synchronize_stream(scheduler_outputs)
+                    # print(f"len(self.kv_swap_meta): {len(self.kv_swap_meta)}")
+                self.kv_swap_meta.popleft()
                 return
             
         if(new_kv_meta.swap_status == SwapStatus.SWAP_IN):
             if(self.current_swap_status == SwapStatus.SWAP_OUT):
                 # TODO call synchronize
                 self.synchronize_stream(scheduler_outputs)
+                # print(f"len(self.kv_swap_meta): {len(self.kv_swap_meta)}")
                 return
             else:
+                
                 scheduler_outputs.refill_index = new_kv_meta.stream_position
                 scheduler_outputs.blocks_to_refill = new_kv_meta.mapping
                 scheduler_outputs.refill_stream = new_kv_meta.stream_list
                 self.current_swap_status = SwapStatus.SWAP_IN
+                # print(f"setting scheduler outputs: refill index:{scheduler_outputs.refill_index}")
+                # print(f"setting scheduler outputs: refill_stream:{scheduler_outputs.refill_stream}")
                 self.stream_pend_sync.extend(new_kv_meta.stream_list)
                 if(new_kv_meta.sync_this_time):
                     self.synchronize_stream(scheduler_outputs)
+                    # print(f"len(self.kv_swap_meta): {len(self.kv_swap_meta)}")
+                self.kv_swap_meta.popleft()
                 return
             
             
@@ -1495,8 +1568,11 @@ class Scheduler:
             set_action = self.stream_to_session[stream_id]
             if(set_action != None and set_action.block_status != None):
                 self.session_dict[set_action.session_id].block_status = set_action.block_status
+                # print(f"Setting {set_action.session_id} block status to {set_action.block_status}")
+                # print(f"scheduler_outputs.refill_stream {scheduler_outputs.refill_stream}")
+                # print(f"scheduler_outputs.refill_index {scheduler_outputs.refill_index}")
             del self.stream_to_session[stream_id]
-            
+        # print(f"syncing following stream: {self.stream_pend_sync}")    
         self.stream_avail.extend(self.stream_pend_sync)
         self.stream_pend_sync = []
         self.current_swap_status = SwapStatus.SYNCHRONIZED
@@ -1605,6 +1681,7 @@ class Scheduler:
         self.try_load_kv_cache()
         self.process_kv_swap_meta(scheduler_outputs=scheduler_outputs)
         self._update_wait_refill()
+        # print(f"kv_swap_meta at 1636:{self.kv_swap_meta}")
         self.time_in_scheduler +=time.time()-schedule_begin
         return seq_group_metadata_list, scheduler_outputs
 
@@ -1638,9 +1715,16 @@ class Scheduler:
         for f_seq_group in new_finished:
             self.session_dict[f_seq_group.session_id].req_status = RequestStatus.TEMP_FINISHED
         self.temp_finished.extend(new_finished)
+        if(len(self.temp_finished)> 0):
+            # print(f"Before: self.cureent swap status:{self.current_swap_status}")
+            # print(f"Before: current kv meta : {self.kv_swap_meta}")
+            self.try_store_kv_cache()
+            # print(f"After: self.cureent swap status:{self.current_swap_status}")
+            # print(f"After: current kv meta : {self.kv_swap_meta}")
+            # print(f"After: self.temp_finished:{self.temp_finished}")
         self.running = deque(seq_group for seq_group in self.running
                              if not seq_group.is_finished())
-        temp_finished_seq_id = [seq_id for seq_group in self.temp_finished for seq_id in seq_group.seqs_dict.keys() ]
+        temp_finished_seq_id = [seq_id for seq_group in new_finished for seq_id in seq_group.seqs_dict.keys() ]
         # for seq_group in self.hung:
         #     for seq_id in seq_group.seqs_dict.keys():
         #         temp_finished_seq_id.append(seq_id) 

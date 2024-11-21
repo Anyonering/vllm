@@ -636,7 +636,8 @@ class SequenceGroup:
 
     def __repr__(self) -> str:
         return (f"SequenceGroup(request_id={self.request_id}, "
-                f"sampling_params={self.sampling_params}, "
+                f"session_id={self.session_id}"
+                # f"sampling_params={self.sampling_params}, "
                 f"num_seqs={len(self.seqs_dict)})")
 
 
