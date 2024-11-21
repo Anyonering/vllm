@@ -122,7 +122,7 @@ class ChatDataLoader(object):
         # print('thread done')
         
     def exceed_length_limit(self, req_data):
-        if(req_data['from']=='human' and len(req_data['value'])> 20000):
+        if(req_data['from']=='human' and len(self.tokenizer.encode(req_data['value']))> 2032):
             return True
         return False
         
@@ -175,7 +175,8 @@ class ChatDataLoader(object):
                 assert next_recv["from"] == "gpt"
                 next_send = input_data.pop(0)
                 assert next_send["from"] == "human"
-                interval_chat_req = len(next_send["value"])/self.mean_type_rate
+                interval_chat_req = min(len(next_send["value"])/self.mean_type_rate,5)
+                
             len_token = 0
             with self.tokenizer_lock:
                 len_token = len(self.tokenizer.encode(total_text)[-(self.max_prompt_len-8):])
@@ -189,7 +190,8 @@ class ChatDataLoader(object):
             #     req_data = next_send
             # TODO Need to be changed to match the actually returned token num
             # interval_info_req = min(answer_len/self.mean_read_rate, 20)
-            interval_info_req = 5
+            # interval_info_req = 5
+            interval_info_req = min(answer_len/self.mean_read_rate, 5)
             # try:
                 
             #     next_recv = self.active_sessions[client_id].pop(0)
@@ -243,7 +245,7 @@ class ChatDataLoader(object):
 
         # get the conversations in the list for client id
 
-        await asyncio.sleep(300)
+        await asyncio.sleep(200)
 
 if __name__ == "__main__":
     dataloader = ChatDataLoader(10, 5, 25, 5, 20, 5)
