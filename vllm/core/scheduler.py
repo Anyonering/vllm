@@ -93,6 +93,8 @@ class SwapStatus(enum.Enum):
 class SetSessionBlockStatus:
     session_id: int
     block_status: BlockStatus  
+    def __str__(self):
+        return f"set session {self.session_id} to {self.block_status}"
 
 @dataclass   
 class KvCacheSwapMeta:   
@@ -110,7 +112,8 @@ class KvCacheSwapMeta:
         self.stream_position = []
         self.sync_this_time = False
         #self.set_session = []
-
+    def __str__(self):
+        return f"swap_status: {self.swap_status}\nstream_list: {self.stream_list}"
 
     
 
@@ -441,7 +444,7 @@ class Scheduler:
         self.current_swap_status: SwapStatus = SwapStatus.SYNCHRONIZED
         # Sequence groups temporarily finished.
         # Contain decode requests that are temporarily holding after finished.
-        self.temp_finished: List[SequenceGroup] = list()
+        self.temp_finished: Deque[SequenceGroup] = deque()
         # a list of sequence waiting to be freed
         self.wait_for_free : List[Sequence] = list()
         # This contains the session_id for the group waiting to be 
@@ -458,6 +461,8 @@ class Scheduler:
         # cuda streams that are currently being used in workers
         self.stream_pend_sync = []
         self.stream_to_session: Dict[int, SetSessionBlockStatus] = {}
+        self.trigger_sync_threshold = 3
+        self.pause_load_kv = False
         # Time at previous scheduling step
         self.prev_time = 0.0
         # Did we schedule a prompt at previous step?
@@ -590,12 +595,39 @@ class Scheduler:
         # for sess_id in self.refill_requests:
         this_session_info = self.session_dict[session_id]
         print(f"This session {session_id} has block status: {this_session_info.block_status}")
+        if(not this_session_info.block_status >=BlockStatus.KICKING_OUT):
+            print(f"self.temp_finsished: {self.temp_finished}")
+            print(f"self.running: {len(self.running)}")
+            print(f"self.kv_swap_meta: {self.kv_swap_meta}")
+            print(f"self.stream_to_session: {self.stream_to_session}")
+            print(f"context group output len: {this_session_info.seq_group.get_seqs()[0].data.get_output_len()}")
+            print(f"previous finished time: {this_session_info.seq_group.metrics.finished_time}, current time: {time.time()}")
+            # the seq group should exist in self.temp_finished
+            finished_seq_group = None
+            assert this_session_info.block_status ==BlockStatus.RUNNING
+            for seq_group in self.temp_finished:
+                if seq_group.session_id == session_id:
+                    finished_seq_group = seq_group
+                    break
+            assert finished_seq_group != None
+            self.temp_finished.remove(finished_seq_group)
+            this_session_info.req_status = RequestStatus.INFO_REQ_ARR
+            this_session_info.block_status = BlockStatus.ON_DEVICE
+            assert this_session_info.seq_group == finished_seq_group
+            return
+            
+            
+            
         # print(f"self.temp_finished:{self.temp_finished}")
         
         assert this_session_info.block_status >=BlockStatus.KICKING_OUT
         if(this_session_info.block_status == BlockStatus.KICKING_OUT):
             assert this_session_info.current_stream != -1
-            self.kv_swap_meta.append(KvCacheSwapMeta(SwapStatus.SYNCHRONIZED))
+            if len(self.kv_swap_meta)> 0:
+                if(self.kv_swap_meta[-1].swap_status != SwapStatus.SYNCHRONIZED):
+                    self.kv_swap_meta[-1].sync_this_time = True
+            else:
+                self.kv_swap_meta.append(KvCacheSwapMeta(SwapStatus.SYNCHRONIZED))
             #self.current_sync.append(this_session_info.last_stream_use)
             this_session_info.req_status = RequestStatus.INFO_REQ_ARR
         
@@ -604,9 +636,13 @@ class Scheduler:
         if(len(self.kv_swap_meta)> 0 and self.kv_swap_meta[-1].swap_status==SwapStatus.SWAP_IN):
             # could not handle this case
             # need to sync first
+            if len(self.temp_finished) >= self.trigger_sync_threshold:
+                self.kv_swap_meta[-1].sync_this_time = True
+                # prioritize store kv cache to host memory
+                self.pause_load_kv = True
             return
         # print("getting here line 606")
-        
+        self.pause_load_kv = False
         if(len(self.temp_finished)> 0):
             # print("getting here line 610")
             # print(f"current swap status: {self.current_swap_status}")
@@ -651,7 +687,7 @@ class Scheduler:
                     # print(f"\n\n\nsetting session {session_id} to kikcing out\n\n\n")
                     self.stream_to_session[stream_id] = SetSessionBlockStatus(session_id=session_id,block_status=BlockStatus.ON_HOST)
                     # print(f"setting stream {stream_id} maps to action: {session_id} to BlockStatus.ON_HOST")
-                    self.temp_finished.pop(0)
+                    self.temp_finished.popleft()
             if(len(new_kv_swap_meta.stream_list)> 0 ):
                 # append this meta to the deque
                 self.kv_swap_meta.append(new_kv_swap_meta)
@@ -1153,6 +1189,7 @@ class Scheduler:
                     ignored_seq_groups.append(seq_group)
                     session_id = seq_group.session_id
                     del self.session_dict[session_id]
+                    print(f"Deleting session_dict with id {session_id} because prompt len is too long!")
                     waiting_queue.popleft()
                     continue
 
@@ -1508,6 +1545,9 @@ class Scheduler:
         if len(self.kv_swap_meta) == 0:
             # nothing to process
             return
+        print(f"length of kv_swap_meta:{len(self.kv_swap_meta)}")
+        if(len(self.temp_finished)> 0):
+            print(f"length of temp finished:{len(self.temp_finished)}")
         new_kv_meta = self.kv_swap_meta[0]
         if(new_kv_meta.swap_status == SwapStatus.SYNCHRONIZED):
             # TODO call synchronize
@@ -1523,16 +1563,20 @@ class Scheduler:
                 # print(f"len(self.kv_swap_meta): {len(self.kv_swap_meta)}")
                 return
             else:
-                # we can assume current_swap_status == SWAP_OUT or SYNCHRONIZED
-                scheduler_outputs.kick_out_index = new_kv_meta.stream_position
-                scheduler_outputs.blocks_to_kick_out = new_kv_meta.mapping
-                scheduler_outputs.kick_out_stream = new_kv_meta.stream_list
-                self.current_swap_status = SwapStatus.SWAP_OUT
-                self.stream_pend_sync.extend(new_kv_meta.stream_list)
-                if(new_kv_meta.sync_this_time):
-                    self.synchronize_stream(scheduler_outputs)
-                    # print(f"len(self.kv_swap_meta): {len(self.kv_swap_meta)}")
-                self.kv_swap_meta.popleft()
+                while(len(self.kv_swap_meta)> 0 and self.kv_swap_meta[0].swap_status == SwapStatus.SWAP_OUT):
+                    # we can assume current_swap_status == SWAP_OUT or SYNCHRONIZED
+                    new_kv_meta = self.kv_swap_meta[0]
+                    scheduler_outputs.kick_out_index.extend(new_kv_meta.stream_position)
+                    scheduler_outputs.blocks_to_kick_out.extend(new_kv_meta.mapping)
+                    scheduler_outputs.kick_out_stream.extend(new_kv_meta.stream_list)
+                    self.current_swap_status = SwapStatus.SWAP_OUT
+                    self.stream_pend_sync.extend(new_kv_meta.stream_list)
+                    if(new_kv_meta.sync_this_time):
+                        self.kv_swap_meta.popleft()
+                        self.synchronize_stream(scheduler_outputs)
+                        return
+                        # print(f"len(self.kv_swap_meta): {len(self.kv_swap_meta)}")
+                    self.kv_swap_meta.popleft()
                 return
             
         if(new_kv_meta.swap_status == SwapStatus.SWAP_IN):
@@ -1678,9 +1722,12 @@ class Scheduler:
             self.block_manager.mark_blocks_as_computed(
                 scheduled_seq_group.seq_group)
         self.try_store_kv_cache()
-        self.try_load_kv_cache()
+        if(not self.pause_load_kv):
+            self.try_load_kv_cache()
         self.process_kv_swap_meta(scheduler_outputs=scheduler_outputs)
         self._update_wait_refill()
+        if(len(self.kv_swap_meta)> self.trigger_sync_threshold):
+            print(f"self.kv_swap_meta: {self.kv_swap_meta}")
         # print(f"kv_swap_meta at 1636:{self.kv_swap_meta}")
         self.time_in_scheduler +=time.time()-schedule_begin
         return seq_group_metadata_list, scheduler_outputs
@@ -1739,6 +1786,7 @@ class Scheduler:
                 self.block_manager.free(seq)
             session_id = instance_seq_group.session_id
             del self.session_dict[session_id]
+            print(f"Deleting session_dict with id {session_id} because it is already last round!")
             
         self.wait_for_free = []
         
