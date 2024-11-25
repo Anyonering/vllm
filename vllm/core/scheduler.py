@@ -471,6 +471,7 @@ class Scheduler:
         self.last_prompt_latency = 0.0
         # preemption mode, RECOMPUTE or SWAP
         self.user_specified_preemption_mode = scheduler_config.preemption_mode
+        self.sync_counter = 0
         # The following field is test-only. It is used to inject artificial
         # preemption.
         self.enable_artificial_preemption = ENABLE_ARTIFICIAL_PREEMPT
@@ -613,6 +614,8 @@ class Scheduler:
             self.temp_finished.remove(finished_seq_group)
             this_session_info.req_status = RequestStatus.INFO_REQ_ARR
             this_session_info.block_status = BlockStatus.ON_DEVICE
+            if(session_id in self.refill_requests):
+                self.refill_requests.remove(session_id)
             assert this_session_info.seq_group == finished_seq_group
             return
             
@@ -633,33 +636,33 @@ class Scheduler:
         
     # store kv cache to host memory
     def try_store_kv_cache(self) -> None:
-        if(len(self.kv_swap_meta)> 0 and self.kv_swap_meta[-1].swap_status==SwapStatus.SWAP_IN):
-            # could not handle this case
-            # need to sync first
-            if len(self.temp_finished) >= self.trigger_sync_threshold:
-                self.kv_swap_meta[-1].sync_this_time = True
-                # prioritize store kv cache to host memory
-                self.pause_load_kv = True
-            return
+        # if(len(self.kv_swap_meta)> 0 and self.kv_swap_meta[-1].swap_status==SwapStatus.SWAP_IN):
+        #     # could not handle this case
+        #     # need to sync first
+        #     if len(self.temp_finished) >= self.trigger_sync_threshold:
+        #         self.kv_swap_meta[-1].sync_this_time = True
+        #         # prioritize store kv cache to host memory
+        #         self.pause_load_kv = True
+        #     return
         # print("getting here line 606")
-        self.pause_load_kv = False
+        # self.pause_load_kv = False
         if(len(self.temp_finished)> 0):
             # print("getting here line 610")
             # print(f"current swap status: {self.current_swap_status}")
-            if(self.current_swap_status == SwapStatus.SWAP_IN):
-                # print("getting here line 613")
-                # print(f"self.current_swap_status: {self.current_swap_status}")
-                # print(f"{self.current_swap_status == SwapStatus.SWAP_IN}")
-                if len(self.kv_swap_meta)> 0:
-                    self.kv_swap_meta[-1].sync_this_time = True
-                else:
-                    self.kv_swap_meta.append(KvCacheSwapMeta(SwapStatus.SYNCHRONIZED))
-                return
-            # print("getting here line 616")
-            # only proceed when self.kv_swap_meta contains nothing or only swap_out meta
-            not_proceed = any(kv_swap_meta.swap_status == SwapStatus.SWAP_IN for kv_swap_meta in self.kv_swap_meta)
-            if(not_proceed):
-                return 
+            # if(self.current_swap_status == SwapStatus.SWAP_IN):
+            #     # print("getting here line 613")
+            #     # print(f"self.current_swap_status: {self.current_swap_status}")
+            #     # print(f"{self.current_swap_status == SwapStatus.SWAP_IN}")
+            #     if len(self.kv_swap_meta)> 0:
+            #         self.kv_swap_meta[-1].sync_this_time = True
+            #     else:
+            #         self.kv_swap_meta.append(KvCacheSwapMeta(SwapStatus.SYNCHRONIZED))
+            #     return
+            # # print("getting here line 616")
+            # # only proceed when self.kv_swap_meta contains nothing or only swap_out meta
+            # not_proceed = any(kv_swap_meta.swap_status == SwapStatus.SWAP_IN for kv_swap_meta in self.kv_swap_meta)
+            # if(not_proceed):
+            #     return 
             # print("getting here line 617")
             new_kv_swap_meta = KvCacheSwapMeta(SwapStatus.SWAP_OUT)
             while len(self.temp_finished) > 0:
@@ -696,20 +699,20 @@ class Scheduler:
     def try_load_kv_cache(self) -> None:
         # need to make sure that previous cache load is sync or is swap_in
         # otherwise might lead to cudamemory error
-        if(len(self.kv_swap_meta)> 0 and self.kv_swap_meta[-1].swap_status==SwapStatus.SWAP_OUT): 
-            # could not handle this case
-            # need to sync first
-            return
+        # if(len(self.kv_swap_meta)> 0 and self.kv_swap_meta[-1].swap_status==SwapStatus.SWAP_OUT): 
+        #     # could not handle this case
+        #     # need to sync first
+        #     return
         # try to load kv cache of wait refill request
         if(len(self.wait_refill)> 0):
-            if(self.current_swap_status == SwapStatus.SWAP_OUT):
-                # if there are some refill requests waiting
-                # issue a sync first
-                if len(self.kv_swap_meta)> 0:
-                    self.kv_swap_meta[-1].sync_this_time = True
-                else:
-                    self.kv_swap_meta.append(KvCacheSwapMeta(SwapStatus.SYNCHRONIZED))
-                return
+            # if(self.current_swap_status == SwapStatus.SWAP_OUT):
+            #     # if there are some refill requests waiting
+            #     # issue a sync first
+            #     if len(self.kv_swap_meta)> 0:
+            #         self.kv_swap_meta[-1].sync_this_time = True
+            #     else:
+            #         self.kv_swap_meta.append(KvCacheSwapMeta(SwapStatus.SYNCHRONIZED))
+            #     return
                 # if len(self.kv_swap_meta)> 0:
                 #     if self.kv_swap_meta[-1].swap_status != SwapStatus.SYNCHRONIZED and self.kv_swap_meta[-1].sync_this_time == False:
                 #         self.kv_swap_meta.append(KvCacheSwapMeta(SwapStatus.SYNCHRONIZED))
@@ -719,9 +722,9 @@ class Scheduler:
                 #     self.kv_swap_meta.append(KvCacheSwapMeta(SwapStatus.SYNCHRONIZED))
                 # return
             
-            not_proceed = any(kv_swap_meta.swap_status == SwapStatus.SWAP_OUT for kv_swap_meta in self.kv_swap_meta)
-            if(not_proceed):
-                return
+            # not_proceed = any(kv_swap_meta.swap_status == SwapStatus.SWAP_OUT for kv_swap_meta in self.kv_swap_meta)
+            # if(not_proceed):
+            #     return
             new_kv_swap_meta = KvCacheSwapMeta(SwapStatus.SWAP_IN)
             for refill_seq_group in self.wait_refill:
                 refill_session_id = refill_seq_group.session_id
@@ -1543,8 +1546,13 @@ class Scheduler:
                     
     def process_kv_swap_meta(self, scheduler_outputs: SchedulerOutputs)-> None:
         if len(self.kv_swap_meta) == 0:
+            self.sync_counter += 1
+            if(self.sync_counter >=10 and self.current_swap_status != SwapStatus.SYNCHRONIZED):
+                self.synchronize_stream(scheduler_outputs=scheduler_outputs)
+                self.sync_counter = 0
             # nothing to process
             return
+        self.sync_counter = 0
         print(f"length of kv_swap_meta:{len(self.kv_swap_meta)}")
         if(len(self.temp_finished)> 0):
             print(f"length of temp finished:{len(self.temp_finished)}")
